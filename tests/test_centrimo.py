@@ -1,5 +1,5 @@
 # test_centrimo.py
-# Contact: Jacob Schreiber <jmschreiber91@gmail.com>
+# Contact: Adam He <adamyhe@gmail.com>
 
 import numpy
 import pandas

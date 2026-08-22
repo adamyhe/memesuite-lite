@@ -1,5 +1,5 @@
 # centrimo.py
-# Author: Jacob Schreiber <jmschreiber91@gmail.com>
+# Author: Adam He <adamyhe@gmail.com>
 
 import math
 import numba
