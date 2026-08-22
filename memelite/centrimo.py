@@ -186,7 +186,7 @@ def centrimo(motifs, sequences, control_sequences=None,
 	alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	eps=0.0001, threshold=0.001, min_width=1, max_width=None, width_step=2,
 	window_widths=None, reverse_complement=True, separate_strands=False,
-	optimize_score=False, max_score_thresholds=50, seqlen=None,
+	flip=False, optimize_score=False, max_score_thresholds=50, seqlen=None,
 	return_site_distances=False, n_jobs=-1):
 	"""An implementation of the CentriMo algorithm from the MEME suite.
 
@@ -245,13 +245,25 @@ def centrimo(motifs, sequences, control_sequences=None,
 	still selected using only the primary sequences before the control set is
 	consulted at all.
 
+	`flip` mirrors the reference CentriMo binary's `--flip` option: reverse
+	complement matches are reported "reflected" around the sequence center
+	(i.e. with their sign negated) rather than at their literal position in
+	the given sequence's forward-strand coordinates. This is a purely
+	presentational convention with no effect on any statistic in the returned
+	dataframe (every test here is computed from the *absolute* distance from
+	center, which a sign flip does not change) -- it only affects the sign of
+	the `-rc` rows within the raw `distances`/`control_distances` arrays
+	returned when `return_site_distances` is True, e.g. for building your own
+	site-probability plot. Because there is no well-defined per-sequence
+	strand identity to reflect once forward and reverse complement scores
+	have been combined into one row, `flip` requires `separate_strands=True`.
+
 	Note that this implementation always requires equal-length sequences
 	(within each of `sequences` and `control_sequences` separately) and
 	exposes the match threshold as a p-value (converted internally to a raw
 	score threshold, as in `fimo`) rather than the reference CentriMo binary's
 	fixed-bits `--score` option, for consistency with the rest of this
-	package. `--flip` (reflecting reverse complement matches around the
-	sequence center for plotting purposes) is not implemented.
+	package.
 
 
 	Parameters
@@ -325,6 +337,13 @@ def centrimo(motifs, sequences, control_sequences=None,
 		False, since there is then no separate strand to report. Default is
 		False.
 
+	flip: bool, optional
+		Whether to report `-rc` rows' site distances reflected around the
+		sequence center (sign-negated) rather than at their literal
+		forward-strand position, mirroring the reference CentriMo binary's
+		`--flip` option. Purely presentational: see the extended description
+		above. Requires `separate_strands=True`. Default is False.
+
 	optimize_score: bool, optional
 		Whether to also search over stricter score thresholds (in addition
 		to the window-width search), reporting whichever (threshold, window)
@@ -382,6 +401,12 @@ def centrimo(motifs, sequences, control_sequences=None,
 		numba.set_num_threads(n_jobs)
 	else:
 		n_jobs = _n_jobs = numba.get_num_threads()
+
+	if flip and not separate_strands:
+		raise ValueError("`flip` requires `separate_strands=True`, since "
+			"there is no well-defined per-sequence strand identity to "
+			"reflect once forward and reverse complement scores have been "
+			"combined into a single row.")
 
 	has_control = control_sequences is not None
 
@@ -499,6 +524,16 @@ def centrimo(motifs, sequences, control_sequences=None,
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)
+
+	if flip:
+		# Purely presentational: reflects each `-rc` row's site distances
+		# around the sequence center. Every statistic below is computed from
+		# `abs(distance)`, which a sign flip leaves unchanged, so this only
+		# affects the raw arrays returned by `return_site_distances`.
+		rc_rows = numpy.array([name.endswith("-rc") for name in names])
+		distances[rc_rows] *= -1
+		if has_control:
+			control_distances[rc_rows] *= -1
 
 	# Compute the enrichment statistics for each motif, testing a range of
 	# window widths (and, if `optimize_score`, score thresholds) and

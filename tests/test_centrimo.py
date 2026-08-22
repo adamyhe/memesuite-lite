@@ -469,3 +469,57 @@ def test_centrimo_optimize_score_max_score_thresholds_caps_grid():
 	row = result.iloc[0]
 	assert not numpy.isnan(row['p_value'])
 	assert 0 <= row['e_value'] <= 1
+
+
+##
+
+
+def test_centrimo_flip_requires_separate_strands():
+	motif = one_hot_encode("ACGTGCA")
+	X = _make_one_hot((10, 4, 50), random_state=35)
+
+	assert_raises(ValueError, centrimo, {'m1': motif.astype('float64')}, X,
+		None, flip=True)
+
+
+def test_centrimo_flip_negates_only_rc_row_distances():
+	# Plant the motif's reverse complement off-center, so a sign flip is
+	# actually observable (planting at the exact center would give a
+	# distance of 0, which is its own negation and wouldn't distinguish the
+	# two cases).
+	n_seqs, seq_len = 50, 101
+	seq = "ACGTGCA"
+	motif = one_hot_encode(seq)
+	rc_motif = one_hot_encode(_reverse_complement_str(seq))
+	offset = 10
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=36)
+	_plant(X, rc_motif, [offset] * n_seqs)
+
+	no_flip, dist_no_flip = centrimo({'m1': motif.astype('float64')}, X,
+		separate_strands=True, return_site_distances=True)
+	flipped, dist_flip = centrimo({'m1': motif.astype('float64')}, X,
+		separate_strands=True, flip=True, return_site_distances=True)
+
+	# The forward row is untouched by `flip`.
+	assert_array_almost_equal(dist_no_flip[0], dist_flip[0])
+
+	# The rc row is sign-negated wherever it has a real (non-NaN) value.
+	valid = ~numpy.isnan(dist_no_flip[1])
+	assert valid.sum() > 0
+	assert_array_almost_equal(dist_flip[1, valid], -dist_no_flip[1, valid])
+
+	# `flip` has no effect on any reported statistic.
+	pandas.testing.assert_frame_equal(no_flip, flipped)
+
+
+def test_centrimo_flip_no_effect_without_return_site_distances():
+	motif = one_hot_encode("ACGTGCA")
+	X = _make_one_hot((30, 4, 101), random_state=37)
+
+	no_flip = centrimo({'m1': motif.astype('float64')}, X,
+		separate_strands=True)
+	flipped = centrimo({'m1': motif.astype('float64')}, X,
+		separate_strands=True, flip=True)
+
+	pandas.testing.assert_frame_equal(no_flip, flipped)
