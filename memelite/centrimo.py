@@ -8,8 +8,8 @@ import pandas
 import scipy.stats
 
 from .io import read_meme
+from .io import _fasta_to_flat_array
 from .fimo import _all_pwm_to_mapping
-from .fimo import _fasta_to_flat_array
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
