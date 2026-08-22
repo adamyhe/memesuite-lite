@@ -21,10 +21,14 @@ def _centrimo_best_sites(X, n_seqs, seq_len, pwm, pwm_lengths, score_thresholds,
 	each sequence, it finds the single best-scoring site (optionally combining
 	the forward and reverse complement strands by taking whichever scores
 	higher at a given position) and records that site's signed distance from
-	the center of the sequence. When several positions are tied for the best
-	score, the average of their distances is used, mirroring the reference
-	CentriMo implementation. Sequences with no site scoring at or above the
-	threshold are marked with NaN and excluded from that motif's analysis.
+	the center of the sequence, along with the raw score it achieved. When
+	several positions are tied for the best score, the average of their
+	distances is used, mirroring the reference CentriMo implementation.
+	Sequences with no site scoring at or above `score_thresholds` have their
+	distance marked with NaN and are excluded from that motif's analysis; the
+	raw best score is still recorded for every sequence regardless, so that
+	callers searching over stricter thresholds (see `centrimo`'s
+	`optimize_score`) do not need to re-scan.
 
 	Unlike FIMO's `_fast_hits`, this function does not build a list of hits:
 	because CentriMo only ever needs one (tie-averaged) distance per sequence
@@ -75,10 +79,15 @@ def _centrimo_best_sites(X, n_seqs, seq_len, pwm, pwm_lengths, score_thresholds,
 	distances: numpy.ndarray, shape=(n_motifs, n_seqs)
 		The signed distance from the sequence center of each sequence's
 		best-scoring site, or NaN if no site reached `score_thresholds`.
+
+	best_scores: numpy.ndarray, shape=(n_motifs, n_seqs)
+		The raw score of each sequence's best-scoring site, recorded
+		unconditionally (i.e. even for sequences below `score_thresholds`).
 	"""
 
 	distances = numpy.empty((n_motifs, n_seqs), dtype=numpy.float64)
 	distances[:] = numpy.nan
+	best_scores = numpy.empty((n_motifs, n_seqs), dtype=numpy.float64)
 
 	half = (seq_len - 1) / 2.0
 
@@ -125,10 +134,11 @@ def _centrimo_best_sites(X, n_seqs, seq_len, pwm, pwm_lengths, score_thresholds,
 					sum_centers += center
 					tie_count += 1
 
+			best_scores[k, s] = best_score
 			if best_score >= thresh:
 				distances[k, s] = sum_centers / tie_count - half
 
-	return distances
+	return distances, best_scores
 
 
 def _load_sequences(sequences, alphabet, seqlen):
@@ -176,7 +186,8 @@ def centrimo(motifs, sequences, control_sequences=None,
 	alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	eps=0.0001, threshold=0.001, min_width=1, max_width=None, width_step=2,
 	window_widths=None, reverse_complement=True, separate_strands=False,
-	seqlen=None, return_site_distances=False, n_jobs=-1):
+	optimize_score=False, max_score_thresholds=50, seqlen=None,
+	return_site_distances=False, n_jobs=-1):
 	"""An implementation of the CentriMo algorithm from the MEME suite.
 
 	This function implements the "Central Motif Enrichment Analysis"
@@ -215,14 +226,32 @@ def centrimo(motifs, sequences, control_sequences=None,
 	since each is reduced to its own center-relative distances independently
 	before the fixed window (a bp radius) is applied to both.
 
+	If `optimize_score` is True, this also runs the reference CentriMo
+	binary's `--optimize_score` mode: rather than fixing the score threshold
+	at the value implied by `threshold`, a range of stricter thresholds is
+	also searched (every distinct score actually achieved by some sequence's
+	best site, at or above the `threshold`-implied minimum, capped at
+	`max_score_thresholds` distinct values) and combined jointly with the
+	window-width search, so both the window and the threshold reported are
+	whichever combination gives the smallest p-value. This can find sharper
+	enrichment when only the sequences with the very strongest matches are
+	truly centrally enriched, at the cost of an additional Bonferroni factor
+	for the number of thresholds tried. Since the qualifying sequence set can
+	now shrink beyond what `threshold` alone implies, `n_sequences` and
+	`n_matching_sequences` reflect the optimized threshold rather than the
+	nominal one, and an `optimized_threshold_p_value` column reports the
+	p-value equivalent of the threshold that was actually selected. When
+	combined with `control_sequences`, the threshold (like the window) is
+	still selected using only the primary sequences before the control set is
+	consulted at all.
+
 	Note that this implementation always requires equal-length sequences
 	(within each of `sequences` and `control_sequences` separately) and
 	exposes the match threshold as a p-value (converted internally to a raw
 	score threshold, as in `fimo`) rather than the reference CentriMo binary's
 	fixed-bits `--score` option, for consistency with the rest of this
 	package. `--flip` (reflecting reverse complement matches around the
-	sequence center for plotting purposes) and `--optimize_score` (searching
-	over score thresholds) are not implemented.
+	sequence center for plotting purposes) is not implemented.
 
 
 	Parameters
@@ -296,6 +325,20 @@ def centrimo(motifs, sequences, control_sequences=None,
 		False, since there is then no separate strand to report. Default is
 		False.
 
+	optimize_score: bool, optional
+		Whether to also search over stricter score thresholds (in addition
+		to the window-width search), reporting whichever (threshold, window)
+		combination is most significant, mirroring the reference CentriMo
+		binary's `--optimize_score` option. See the extended description
+		above. Default is False.
+
+	max_score_thresholds: int, optional
+		The maximum number of distinct score thresholds to test when
+		`optimize_score` is True. If more distinct scores are actually
+		achieved than this, an evenly-spaced subset is used instead, to
+		bound both the search cost and the Bonferroni penalty it incurs.
+		Ignored when `optimize_score` is False. Default is 50.
+
 	seqlen: int or None, optional
 		When `sequences` is a FASTA filepath, only sequences of this length
 		are used; sequences of any other length are ignored. If None, uses
@@ -320,7 +363,8 @@ def centrimo(motifs, sequences, control_sequences=None,
 		enrichment statistics. When `control_sequences` is given, this also
 		includes the control set's sequence/match counts at that window and
 		the Fisher's exact test p-value/E-value for the differential
-		comparison.
+		comparison. When `optimize_score` is given, this also includes the
+		p-value equivalent of the score threshold that was selected.
 
 	distances: numpy.ndarray, shape=(n_motifs, n_sequences), optional
 		Only returned when `return_site_distances` is True. The signed
@@ -344,6 +388,9 @@ def centrimo(motifs, sequences, control_sequences=None,
 	columns = ['motif_name', 'motif_idx', 'width', 'n_sequences',
 		'n_valid_positions', 'best_window_width', 'n_matching_sequences',
 		'p_value', 'e_value']
+
+	if optimize_score:
+		columns += ['optimized_threshold_p_value']
 
 	if has_control:
 		columns += ['n_control_sequences', 'n_control_matching_sequences',
@@ -442,27 +489,29 @@ def centrimo(motifs, sequences, control_sequences=None,
 			raise ValueError(f"Motif '{bad}' (width {int(widths.max())}) is "
 				f"wider than the control sequence length ({neg_seq_len}).")
 
-	distances = _centrimo_best_sites(X, n_seqs, seq_len, log_pwm, pwm_lengths,
-		score_thresholds, reverse_complement, n_motifs)
+	distances, best_scores = _centrimo_best_sites(X, n_seqs, seq_len, log_pwm,
+		pwm_lengths, score_thresholds, reverse_complement, n_motifs)
 
 	if has_control:
-		control_distances = _centrimo_best_sites(X_neg, n_neg_seqs,
-			neg_seq_len, log_pwm, pwm_lengths, score_thresholds,
+		control_distances, control_best_scores = _centrimo_best_sites(X_neg,
+			n_neg_seqs, neg_seq_len, log_pwm, pwm_lengths, score_thresholds,
 			reverse_complement, n_motifs)
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)
 
 	# Compute the enrichment statistics for each motif, testing a range of
-	# window widths and correcting for the number tested. This operates on
-	# the small `distances` array only, and so is not a throughput bottleneck.
+	# window widths (and, if `optimize_score`, score thresholds) and
+	# correcting for the number tested. This operates on the small
+	# `distances`/`best_scores` arrays only, and so is not a throughput
+	# bottleneck.
 	rows = []
 	for k in range(n_motifs):
 		w = int(widths[k])
 		n_valid_positions = seq_len - w + 1
 
 		valid = ~numpy.isnan(distances[k])
-		n = int(valid.sum())
+		n_nominal = int(valid.sum())
 
 		if window_widths is not None:
 			cand_widths = numpy.asarray(window_widths)
@@ -472,37 +521,99 @@ def centrimo(motifs, sequences, control_sequences=None,
 
 		cand_widths = cand_widths[(cand_widths >= 1) &
 			(cand_widths <= n_valid_positions)]
+		radii = ((cand_widths - 1) // 2).astype(numpy.float64)
+		p_null = cand_widths / n_valid_positions
 
 		if has_control:
 			neg_valid = ~numpy.isnan(control_distances[k])
-			n_neg = int(neg_valid.sum())
-			abs_d_neg = numpy.abs(control_distances[k, neg_valid])
+			n_neg_nominal = int(neg_valid.sum())
 
-		if n == 0 or len(cand_widths) == 0:
-			row = (names[k], k, w, n, n_valid_positions, numpy.nan, 0, 1.0, 1.0)
+		if n_nominal == 0 or len(cand_widths) == 0:
+			row = (names[k], k, w, n_nominal, n_valid_positions, numpy.nan,
+				0, 1.0, 1.0)
+			if optimize_score:
+				row += (1.0,)
 			if has_control:
-				row += (n_neg, 0, 1.0, 1.0)
+				row += (n_neg_nominal, 0, 1.0, 1.0)
 			rows.append(row)
 			continue
 
-		abs_d = numpy.sort(numpy.abs(distances[k, valid]))
-		radii = ((cand_widths - 1) // 2).astype(numpy.float64)
-		counts = numpy.searchsorted(abs_d, radii, side='right')
+		abs_d = numpy.abs(distances[k, valid])
 
-		p_null = cand_widths / n_valid_positions
-		p_values = scipy.stats.binom.sf(counts - 1, n, p_null)
+		if not optimize_score:
+			sorted_abs_d = numpy.sort(abs_d)
+			counts = numpy.searchsorted(sorted_abs_d, radii, side='right')
+			p_values = scipy.stats.binom.sf(counts - 1, n_nominal, p_null)
 
-		best = int(numpy.argmin(p_values))
-		e_value = min(p_values[best] * len(cand_widths) * n_motifs, 1.0)
+			best = int(numpy.argmin(p_values))
+			n = n_nominal
+			best_width = int(cand_widths[best])
+			k_pos = int(counts[best])
+			r_star = radii[best]
+			t_star = None
+			p_value = float(p_values[best])
+			e_value = min(p_value * len(cand_widths) * n_motifs, 1.0)
+		else:
+			# Search jointly over score thresholds (every distinct score
+			# actually achieved by some sequence's best site, at or above
+			# the `threshold`-implied minimum already baked into `valid`)
+			# and window widths, reporting whichever combination is most
+			# significant.
+			scores_valid = best_scores[k, valid]
+			grid = numpy.unique(scores_valid)
 
-		row = (names[k], k, w, n, n_valid_positions, int(cand_widths[best]),
-			int(counts[best]), float(p_values[best]), float(e_value))
+			if len(grid) > max_score_thresholds:
+				idx = numpy.unique(numpy.round(numpy.linspace(
+					0, len(grid) - 1, max_score_thresholds)).astype(numpy.int64))
+				grid = grid[idx]
+
+			best_p, best_width, k_pos, n, t_star, r_star = (numpy.inf,
+				int(cand_widths[0]), 0, 0, grid[0], radii[0])
+
+			for t in grid:
+				sub = scores_valid >= t
+				n_t = int(sub.sum())
+				if n_t == 0:
+					continue
+
+				sorted_abs_d_t = numpy.sort(abs_d[sub])
+				counts_t = numpy.searchsorted(sorted_abs_d_t, radii, side='right')
+				p_values_t = scipy.stats.binom.sf(counts_t - 1, n_t, p_null)
+
+				local_best = int(numpy.argmin(p_values_t))
+				if p_values_t[local_best] < best_p:
+					best_p = p_values_t[local_best]
+					best_width = int(cand_widths[local_best])
+					k_pos = int(counts_t[local_best])
+					n = n_t
+					t_star = t
+					r_star = radii[local_best]
+
+			p_value = float(best_p)
+			e_value = min(p_value * len(grid) * len(cand_widths) * n_motifs, 1.0)
+
+			bin_idx = int(round(t_star / bin_size)) - int(_smallest[k])
+			bin_idx = min(max(bin_idx, 0), len(_score_to_pvals[k]) - 1)
+			optimized_threshold_p_value = float(2.0 ** _score_to_pvals[k][bin_idx])
+
+		row = (names[k], k, w, n, n_valid_positions, best_width, k_pos,
+			p_value, float(e_value))
+
+		if optimize_score:
+			row += (optimized_threshold_p_value,)
 
 		if has_control:
-			# The window was selected using only the primary sequences above,
-			# so the control set cannot bias which window gets tested here.
-			r_star = radii[best]
-			k_pos = int(counts[best])
+			# The window (and, if `optimize_score`, the threshold) was
+			# selected using only the primary sequences above, so the
+			# control set cannot bias which one gets tested here.
+			if optimize_score:
+				neg_sub = control_best_scores[k, neg_valid] >= t_star
+				n_neg = int(neg_sub.sum())
+				abs_d_neg = numpy.abs(control_distances[k, neg_valid])[neg_sub]
+			else:
+				n_neg = n_neg_nominal
+				abs_d_neg = numpy.abs(control_distances[k, neg_valid])
+
 			k_neg = int((abs_d_neg <= r_star).sum())
 
 			if n_neg == 0:

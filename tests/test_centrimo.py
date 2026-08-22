@@ -128,12 +128,13 @@ def test_centrimo_tie_averaging():
 	pwm_lengths = numpy.array([0, 1], dtype=numpy.int64)
 	score_thresholds = numpy.array([-100.0])
 
-	distances = _centrimo_best_sites(X, 1, 10, pwm, pwm_lengths,
+	distances, best_scores = _centrimo_best_sites(X, 1, 10, pwm, pwm_lengths,
 		score_thresholds, False, 1)
 
 	expected_center = (2 + 3) / 2
 	expected_distance = expected_center - (10 - 1) / 2.0
 	assert_array_almost_equal(distances, [[expected_distance]])
+	assert_array_almost_equal(best_scores, [[5.0]])
 
 
 def test_centrimo_below_threshold_excluded():
@@ -380,3 +381,91 @@ def test_centrimo_separate_strands_noop_without_reverse_complement():
 
 	assert tuple(result.columns) == COLUMNS
 	assert list(result['motif_name']) == ['m1']
+
+
+##
+
+
+def test_centrimo_optimize_score_finds_stricter_threshold():
+	# A loose nominal threshold lets in a lot of background noise alongside
+	# the 100 planted exact matches; optimize_score should find that a much
+	# stricter cutoff (closer to requiring the exact match) is far more
+	# centrally enriched than the full, noisy nominal-threshold set.
+	n_seqs, seq_len = 300, 101
+	motif = one_hot_encode("ACGTGCA")
+	w = motif.shape[-1]
+	center = (seq_len - w) // 2
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=30)
+	_plant(X, motif, [center] * 100)
+
+	default = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05)
+	optimized = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05,
+		optimize_score=True)
+
+	assert tuple(optimized.columns) == COLUMNS + ('optimized_threshold_p_value',)
+
+	row_default = default.iloc[0]
+	row_opt = optimized.iloc[0]
+
+	assert row_opt['optimized_threshold_p_value'] <= 0.05
+	assert row_opt['p_value'] <= row_default['p_value']
+	assert row_opt['n_sequences'] <= row_default['n_sequences']
+	assert row_opt['e_value'] < row_default['e_value']
+
+
+def test_centrimo_optimize_score_with_control_sequences():
+	n_seqs, seq_len = 300, 101
+	motif = one_hot_encode("ACGTGCA")
+	w = motif.shape[-1]
+	center = (seq_len - w) // 2
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=31)
+	_plant(X, motif, [center] * 100)
+
+	r = numpy.random.RandomState(32)
+	X_control = _make_one_hot((n_seqs, 4, seq_len), random_state=32)
+	offsets = r.choice([0, seq_len - w], size=100)
+	_plant(X_control, motif, offsets)
+
+	result = centrimo({'m1': motif.astype('float64')}, X,
+		control_sequences=X_control, threshold=0.05, optimize_score=True)
+
+	assert tuple(result.columns) == (COLUMNS + ('optimized_threshold_p_value',)
+		+ CONTROL_COLUMNS[len(COLUMNS):])
+
+	row = result.iloc[0]
+	assert row['fisher_e_value'] < 1e-10
+
+
+def test_centrimo_optimize_score_no_qualifying_sequences():
+	# An extremely strict nominal threshold that nothing can pass makes
+	# `score_thresholds` infinite, so `n_sequences` is deterministically 0
+	# regardless of the random background -- this exercises the early-exit
+	# branch's optimize_score column.
+	motif = one_hot_encode("ACGTACGTAC")  # width 10
+	X = _make_one_hot((10, 4, 20), random_state=33)
+
+	result = centrimo({'m1': motif.astype('float64')}, X, threshold=1e-12,
+		optimize_score=True)
+
+	row = result.iloc[0]
+	assert row['n_sequences'] == 0
+	assert row['optimized_threshold_p_value'] == 1.0
+
+
+def test_centrimo_optimize_score_max_score_thresholds_caps_grid():
+	n_seqs, seq_len = 200, 101
+	motif = one_hot_encode("ACGTGCA")
+	w = motif.shape[-1]
+	center = (seq_len - w) // 2
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=34)
+	_plant(X, motif, [center] * 100)
+
+	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05,
+		optimize_score=True, max_score_thresholds=2)
+
+	row = result.iloc[0]
+	assert not numpy.isnan(row['p_value'])
+	assert 0 <= row['e_value'] <= 1
