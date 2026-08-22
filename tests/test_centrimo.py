@@ -317,3 +317,66 @@ def test_centrimo_control_shorter_than_motif_raises():
 
 	assert_raises(ValueError, centrimo, {'m1': motif.astype('float64')}, X,
 		X_control)
+
+
+##
+
+
+def test_centrimo_separate_strands_reports_two_rows():
+	motif = one_hot_encode("ACGTGCA")  # not self-reverse-complementary
+	X = _make_one_hot((50, 4, 101), random_state=21)
+
+	result = centrimo({'m1': motif.astype('float64')}, X,
+		separate_strands=True)
+
+	assert tuple(result.columns) == COLUMNS
+	assert list(result['motif_name']) == ['m1', 'm1-rc']
+	assert list(result['motif_idx']) == [0, 1]
+
+
+def test_centrimo_separate_strands_detects_correct_strand():
+	n_seqs, seq_len = 200, 101
+	seq = "ACGTGCA"
+	rc_seq = _reverse_complement_str(seq)
+
+	motif = one_hot_encode(seq)
+	rc_motif = one_hot_encode(rc_seq)
+	w = motif.shape[-1]
+	center = (seq_len - w) // 2
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=22)
+	_plant(X, rc_motif, [center] * 150)
+
+	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001,
+		separate_strands=True)
+
+	fwd_row = result[result['motif_name'] == 'm1'].iloc[0]
+	rc_row = result[result['motif_name'] == 'm1-rc'].iloc[0]
+
+	assert rc_row['e_value'] < 1e-10
+	assert rc_row['n_matching_sequences'] >= 0.9 * 150
+	assert fwd_row['e_value'] > rc_row['e_value']
+
+
+def test_centrimo_separate_strands_multiple_motifs():
+	motifs = {
+		'm1': one_hot_encode("ACGTGCA").astype('float64'),
+		'm2': one_hot_encode("TTGCCAA").astype('float64'),
+	}
+	X = _make_one_hot((50, 4, 101), random_state=23)
+
+	result = centrimo(motifs, X, separate_strands=True)
+
+	assert list(result['motif_name']) == ['m1', 'm2', 'm1-rc', 'm2-rc']
+	assert list(result['motif_idx']) == [0, 1, 2, 3]
+
+
+def test_centrimo_separate_strands_noop_without_reverse_complement():
+	motif = one_hot_encode("ACGTGCA")
+	X = _make_one_hot((50, 4, 101), random_state=24)
+
+	result = centrimo({'m1': motif.astype('float64')}, X,
+		separate_strands=True, reverse_complement=False)
+
+	assert tuple(result.columns) == COLUMNS
+	assert list(result['motif_name']) == ['m1']

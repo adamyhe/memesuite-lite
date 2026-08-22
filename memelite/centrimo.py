@@ -175,8 +175,8 @@ def _load_sequences(sequences, alphabet, seqlen):
 def centrimo(motifs, sequences, control_sequences=None,
 	alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	eps=0.0001, threshold=0.001, min_width=1, max_width=None, width_step=2,
-	window_widths=None, reverse_complement=True, seqlen=None,
-	return_site_distances=False, n_jobs=-1):
+	window_widths=None, reverse_complement=True, separate_strands=False,
+	seqlen=None, return_site_distances=False, n_jobs=-1):
 	"""An implementation of the CentriMo algorithm from the MEME suite.
 
 	This function implements the "Central Motif Enrichment Analysis"
@@ -220,8 +220,9 @@ def centrimo(motifs, sequences, control_sequences=None,
 	exposes the match threshold as a p-value (converted internally to a raw
 	score threshold, as in `fimo`) rather than the reference CentriMo binary's
 	fixed-bits `--score` option, for consistency with the rest of this
-	package. `--sep`/`--flip` (separate-strand reporting) and
-	`--optimize_score` (searching over score thresholds) are not implemented.
+	package. `--flip` (reflecting reverse complement matches around the
+	sequence center for plotting purposes) and `--optimize_score` (searching
+	over score thresholds) are not implemented.
 
 
 	Parameters
@@ -282,7 +283,18 @@ def centrimo(motifs, sequences, control_sequences=None,
 	reverse_complement: bool, optional
 		Whether to also score the reverse complement strand at each position,
 		combining it with the forward strand by taking whichever scores
-		higher. Default is True.
+		higher (unless `separate_strands` is True). Default is True.
+
+	separate_strands: bool, optional
+		By default, when `reverse_complement` is True, the forward and
+		reverse complement strands are combined into a single reported
+		motif (whichever strand scores higher at a given position wins).
+		Setting this to True instead reports each strand as its own row,
+		named `{motif_name}` and `{motif_name}-rc`, each independently
+		scanned, windowed, and tested -- mirroring the reference CentriMo
+		binary's `--sep` option. Has no effect when `reverse_complement` is
+		False, since there is then no separate strand to report. Default is
+		False.
 
 	seqlen: int or None, optional
 		When `sequences` is a FASTA filepath, only sequences of this length
@@ -363,6 +375,19 @@ def centrimo(motifs, sequences, control_sequences=None,
 				raise ValueError(
 					f"`motifs` must be a dict[str, numpy.ndarray], not {type(pwm)}.")
 		pwms.append(pwm)
+
+	if separate_strands and reverse_complement:
+		# Expand each motif into its own forward and reverse complement
+		# entries up front, then scan the rest of the pipeline with
+		# `reverse_complement=False`: each entry is now single-stranded, so
+		# there is nothing left to combine at the kernel level, and every
+		# downstream step (window search, E-value, the differential Fisher
+		# test) runs identically per entry, exactly as it would for any two
+		# independent motifs.
+		names = names + [name + "-rc" for name in names]
+		pwms = pwms + [pwm[::-1, ::-1] for pwm in pwms]
+		n_motifs = len(names)
+		reverse_complement = False
 
 	widths = numpy.array([pwm.shape[-1] for pwm in pwms], dtype=numpy.int64)
 	fwd_lengths = numpy.cumsum([0] + list(widths)).astype(numpy.int64)
