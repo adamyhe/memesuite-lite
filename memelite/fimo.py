@@ -202,6 +202,62 @@ def _fast_convert(X, mapping):
 		X[i] = mapping[X[i]]
 
 
+def _fasta_to_flat_array(filename, alphabet=['A', 'C', 'G', 'T']):
+	"""An internal function for loading a FASTA file into a flat int8 array.
+
+	This method reads in a FASTA-formatted file and returns the sequences
+	concatenated into a single flat array of alphabet indexes (-1 for any
+	character not in the alphabet, e.g. 'N'), along with a cumulative offset
+	array demarcating where each sequence begins and ends. This representation
+	supports sequences of different lengths.
+
+
+	Parameters
+	----------
+	filename: str
+		The filename of the FASTA-formatted file to read in.
+
+	alphabet: list, optional
+		A list of characters to use for the alphabet, defining the order that
+		characters should appear. Default is ['A', 'C', 'G', 'T'].
+
+
+	Returns
+	-------
+	names: numpy.ndarray
+		The names of the sequences in the FASTA file, in order.
+
+	X: numpy.ndarray, shape=(-1,)
+		A flat int8 array of alphabet indexes for all sequences concatenated
+		together.
+
+	X_lengths: numpy.ndarray, shape=(len(names)+1,)
+		The cumulative offsets demarcating each sequence's span within `X`.
+	"""
+
+	fasta = pyfaidx.Fasta(filename)
+	names = numpy.array(list(fasta.keys()))
+	X, lengths = [], [0]
+
+	alphabet = ''.join(alphabet)
+	alpha_idxs = numpy.frombuffer(bytearray(alphabet, 'utf8'), dtype=numpy.int8)
+	one_hot_mapping = numpy.zeros(256, dtype=numpy.int8) - 1
+	for i, idx in enumerate(alpha_idxs):
+		one_hot_mapping[idx] = i
+
+	for name, chrom in fasta.items():
+		chrom = chrom[:].seq.upper()
+		lengths.append(lengths[-1] + len(chrom))
+
+		X_idxs = numpy.frombuffer(bytearray(chrom, "utf8"), dtype=numpy.int8)
+		_fast_convert(X_idxs, one_hot_mapping)
+		X.append(X_idxs)
+
+	X = numpy.concatenate(X)
+	X_lengths = numpy.array(lengths, dtype=numpy.int64)
+	return names, X, X_lengths
+
+
 def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1, 
 	eps=0.0001, threshold=0.0001, reverse_complement=True, return_counts=False, 
 	dim=0):
@@ -333,29 +389,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	# Extract the sequence from a FASTA
 	if isinstance(sequences, str):
-		fasta = pyfaidx.Fasta(sequences)
-		sequence_names = numpy.array(list(fasta.keys()))
-		X, lengths = [], [0]
-		
-		alphabet = ''.join(alphabet)
-		alpha_idxs = numpy.frombuffer(bytearray(alphabet, 'utf8'), 
-			dtype=numpy.int8)
-		one_hot_mapping = numpy.zeros(256, dtype=numpy.int8) - 1
-		for i, idx in enumerate(alpha_idxs):
-			one_hot_mapping[idx] = i
-		
-		for name, chrom in fasta.items():
-			chrom = chrom[:].seq.upper()
-			lengths.append(lengths[-1] + len(chrom))
-			
-			X_idxs = numpy.frombuffer(bytearray(chrom, "utf8"), 
-				dtype=numpy.int8)
-			_fast_convert(X_idxs, one_hot_mapping)
-			X.append(X_idxs)
-			
-		X = numpy.concatenate(X)
-		X_lengths = numpy.array(lengths, dtype=numpy.int64)
-		
+		sequence_names, X, X_lengths = _fasta_to_flat_array(sequences, alphabet)
+
 	elif not isinstance(sequences, numpy.ndarray):
 		sequences = sequences.numpy()
 			

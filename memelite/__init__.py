@@ -6,3 +6,4 @@ __version__ = '0.4.0'
 from .fimo import fimo
 from .tomtom import tomtom
 from .symmetric_tomtom import symmetric_tomtom
+from .centrimo import centrimo
