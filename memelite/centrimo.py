@@ -131,7 +131,49 @@ def _centrimo_best_sites(X, n_seqs, seq_len, pwm, pwm_lengths, score_thresholds,
 	return distances
 
 
-def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
+def _load_sequences(sequences, alphabet, seqlen):
+	"""An internal function for loading a set of equal-length sequences.
+
+	This function accepts either a FASTA filepath or a one-hot numpy array
+	and returns the flat int8 representation `_centrimo_best_sites` expects,
+	along with the number and length of the sequences it contains. When
+	`sequences` is a FASTA filepath, only sequences matching `seqlen` (or the
+	length of the first sequence in the file, if `seqlen` is None) are kept,
+	mirroring the reference CentriMo binary's own default `--seqlen`
+	behavior rather than requiring the caller to pre-filter the file.
+	"""
+
+	if isinstance(sequences, str):
+		_, X_flat, X_lengths = _fasta_to_flat_array(sequences, alphabet)
+		seq_lens = numpy.diff(X_lengths)
+
+		target_len = seqlen if seqlen is not None else int(seq_lens[0])
+		keep = numpy.where(seq_lens == target_len)[0]
+		n_dropped = len(seq_lens) - len(keep)
+
+		if n_dropped > 0:
+			print(f"centrimo: ignoring {n_dropped} sequence(s) not of length "
+				f"{target_len} (use `seqlen` to select a different length).")
+
+		seq_len = target_len
+		n_seqs = len(keep)
+		X = numpy.empty(n_seqs * seq_len, dtype=numpy.int8)
+		for out_i, in_i in enumerate(keep):
+			X[out_i*seq_len:(out_i+1)*seq_len] = X_flat[X_lengths[in_i]:X_lengths[in_i+1]]
+
+	else:
+		if not isinstance(sequences, numpy.ndarray):
+			sequences = sequences.numpy()
+
+		n_seqs, _, seq_len = sequences.shape
+		X = ((sequences.argmax(axis=1) + 1) * sequences.sum(axis=1)) - 1
+		X = X.astype(numpy.int8).flatten()
+
+	return X, n_seqs, seq_len
+
+
+def centrimo(motifs, sequences, control_sequences=None,
+	alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	eps=0.0001, threshold=0.001, min_width=1, max_width=None, width_step=2,
 	window_widths=None, reverse_complement=True, seqlen=None,
 	return_site_distances=False, n_jobs=-1):
@@ -159,13 +201,27 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	p-value is reported, Bonferroni-corrected for the number of window widths
 	and the number of motifs tested.
 
-	Note that this implementation always requires equal-length sequences and
+	If `control_sequences` is given, this also runs the reference CentriMo
+	binary's `--neg` differential/comparative mode: the enriched window for
+	each motif is still selected using only the primary `sequences` (exactly
+	as above, so the control set cannot bias which window is chosen), and
+	then a one-sided Fisher's exact test compares, at that fixed window, the
+	number of primary vs. control sequences whose best site falls inside it
+	versus outside it. This answers a different question than the one-sample
+	test: not "is this motif centrally enriched at all," but "is it more
+	centrally enriched in the primary set than in the control set" (e.g.
+	bound vs. unbound peaks, or real vs. shuffled sequences). The primary and
+	control sets do not need to have the same length or number of sequences,
+	since each is reduced to its own center-relative distances independently
+	before the fixed window (a bp radius) is applied to both.
+
+	Note that this implementation always requires equal-length sequences
+	(within each of `sequences` and `control_sequences` separately) and
 	exposes the match threshold as a p-value (converted internally to a raw
 	score threshold, as in `fimo`) rather than the reference CentriMo binary's
 	fixed-bits `--score` option, for consistency with the rest of this
-	package. The `--neg` control-sequence/Fisher's-exact differential mode,
-	`--sep`/`--flip` (separate-strand reporting), and `--optimize_score`
-	(searching over score thresholds) are not implemented.
+	package. `--sep`/`--flip` (separate-strand reporting) and
+	`--optimize_score` (searching over score thresholds) are not implemented.
 
 
 	Parameters
@@ -181,6 +237,13 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		only sequences matching the length of the first sequence (or
 		`seqlen`, if provided) will be used. If this is a numpy array, it
 		must have shape (n_sequences, len(alphabet), sequence_length).
+
+	control_sequences: str or numpy.ndarray or None, optional
+		An optional set of control/background sequences (e.g. unbound peaks
+		or shuffled sequences), in the same format as `sequences`, that
+		triggers the differential (`--neg`-style) comparison described
+		above. Its sequences must be equal-length among themselves, but need
+		not match the length or count of `sequences`. Default is None.
 
 	alphabet: list, optional
 		A list of characters to use for the alphabet, defining the order that
@@ -242,12 +305,20 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	results: pandas.DataFrame
 		A dataframe with one row per motif, containing the number of
 		sequences used, the best window found, and the corresponding
-		enrichment statistics.
+		enrichment statistics. When `control_sequences` is given, this also
+		includes the control set's sequence/match counts at that window and
+		the Fisher's exact test p-value/E-value for the differential
+		comparison.
 
 	distances: numpy.ndarray, shape=(n_motifs, n_sequences), optional
 		Only returned when `return_site_distances` is True. The signed
 		distance from the sequence center of each sequence's best site for
 		each motif, or NaN if no site reached the threshold.
+
+	control_distances: numpy.ndarray, shape=(n_motifs, n_control_sequences), optional
+		Only returned when `return_site_distances` is True and
+		`control_sequences` was given. The same as `distances`, but for the
+		control sequences.
 	"""
 
 	if n_jobs != -1:
@@ -256,9 +327,15 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	else:
 		n_jobs = _n_jobs = numba.get_num_threads()
 
+	has_control = control_sequences is not None
+
 	columns = ['motif_name', 'motif_idx', 'width', 'n_sequences',
 		'n_valid_positions', 'best_window_width', 'n_matching_sequences',
 		'p_value', 'e_value']
+
+	if has_control:
+		columns += ['n_control_sequences', 'n_control_matching_sequences',
+			'fisher_p_value', 'fisher_e_value']
 
 	# Extract the motifs
 	if isinstance(motifs, str):
@@ -318,31 +395,7 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 			score_thresholds[i] = float("inf")
 
 	# Extract the sequences, requiring that they all have the same length
-	if isinstance(sequences, str):
-		_, X_flat, X_lengths = _fasta_to_flat_array(sequences, alphabet)
-		seq_lens = numpy.diff(X_lengths)
-
-		target_len = seqlen if seqlen is not None else int(seq_lens[0])
-		keep = numpy.where(seq_lens == target_len)[0]
-		n_dropped = len(seq_lens) - len(keep)
-
-		if n_dropped > 0:
-			print(f"centrimo: ignoring {n_dropped} sequence(s) not of length "
-				f"{target_len} (use `seqlen` to select a different length).")
-
-		seq_len = target_len
-		n_seqs = len(keep)
-		X = numpy.empty(n_seqs * seq_len, dtype=numpy.int8)
-		for out_i, in_i in enumerate(keep):
-			X[out_i*seq_len:(out_i+1)*seq_len] = X_flat[X_lengths[in_i]:X_lengths[in_i+1]]
-
-	else:
-		if not isinstance(sequences, numpy.ndarray):
-			sequences = sequences.numpy()
-
-		n_seqs, _, seq_len = sequences.shape
-		X = ((sequences.argmax(axis=1) + 1) * sequences.sum(axis=1)) - 1
-		X = X.astype(numpy.int8).flatten()
+	X, n_seqs, seq_len = _load_sequences(sequences, alphabet, seqlen)
 
 	if n_seqs == 0:
 		raise ValueError("Cannot run centrimo with zero sequences.")
@@ -352,8 +405,25 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		raise ValueError(f"Motif '{bad}' (width {int(widths.max())}) is wider "
 			f"than the sequence length ({seq_len}).")
 
+	if has_control:
+		X_neg, n_neg_seqs, neg_seq_len = _load_sequences(control_sequences,
+			alphabet, seqlen)
+
+		if n_neg_seqs == 0:
+			raise ValueError("Cannot run centrimo with zero control sequences.")
+
+		if widths.max() > neg_seq_len:
+			bad = names[int(widths.argmax())]
+			raise ValueError(f"Motif '{bad}' (width {int(widths.max())}) is "
+				f"wider than the control sequence length ({neg_seq_len}).")
+
 	distances = _centrimo_best_sites(X, n_seqs, seq_len, log_pwm, pwm_lengths,
 		score_thresholds, reverse_complement, n_motifs)
+
+	if has_control:
+		control_distances = _centrimo_best_sites(X_neg, n_neg_seqs,
+			neg_seq_len, log_pwm, pwm_lengths, score_thresholds,
+			reverse_complement, n_motifs)
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)
@@ -378,9 +448,16 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		cand_widths = cand_widths[(cand_widths >= 1) &
 			(cand_widths <= n_valid_positions)]
 
+		if has_control:
+			neg_valid = ~numpy.isnan(control_distances[k])
+			n_neg = int(neg_valid.sum())
+			abs_d_neg = numpy.abs(control_distances[k, neg_valid])
+
 		if n == 0 or len(cand_widths) == 0:
-			rows.append((names[k], k, w, n, n_valid_positions, numpy.nan, 0,
-				1.0, 1.0))
+			row = (names[k], k, w, n, n_valid_positions, numpy.nan, 0, 1.0, 1.0)
+			if has_control:
+				row += (n_neg, 0, 1.0, 1.0)
+			rows.append(row)
 			continue
 
 		abs_d = numpy.sort(numpy.abs(distances[k, valid]))
@@ -393,13 +470,32 @@ def centrimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		best = int(numpy.argmin(p_values))
 		e_value = min(p_values[best] * len(cand_widths) * n_motifs, 1.0)
 
-		rows.append((names[k], k, w, n, n_valid_positions,
-			int(cand_widths[best]), int(counts[best]), float(p_values[best]),
-			float(e_value)))
+		row = (names[k], k, w, n, n_valid_positions, int(cand_widths[best]),
+			int(counts[best]), float(p_values[best]), float(e_value))
+
+		if has_control:
+			# The window was selected using only the primary sequences above,
+			# so the control set cannot bias which window gets tested here.
+			r_star = radii[best]
+			k_pos = int(counts[best])
+			k_neg = int((abs_d_neg <= r_star).sum())
+
+			if n_neg == 0:
+				fisher_p = 1.0
+			else:
+				table = [[k_pos, n - k_pos], [k_neg, n_neg - k_neg]]
+				_, fisher_p = scipy.stats.fisher_exact(table, alternative='greater')
+
+			fisher_e = min(fisher_p * n_motifs, 1.0)
+			row += (n_neg, k_neg, float(fisher_p), float(fisher_e))
+
+		rows.append(row)
 
 	result = pandas.DataFrame(rows, columns=columns)
 
 	if return_site_distances:
+		if has_control:
+			return result, distances, control_distances
 		return result, distances
 
 	return result

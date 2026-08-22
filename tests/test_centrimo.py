@@ -19,6 +19,9 @@ COLUMNS = ('motif_name', 'motif_idx', 'width', 'n_sequences',
 	'n_valid_positions', 'best_window_width', 'n_matching_sequences',
 	'p_value', 'e_value')
 
+CONTROL_COLUMNS = COLUMNS + ('n_control_sequences',
+	'n_control_matching_sequences', 'fisher_p_value', 'fisher_e_value')
+
 
 def _make_one_hot(shape, random_state=None):
 	"""Build a correctly-formed random one-hot array with a fixed random
@@ -203,3 +206,114 @@ def test_centrimo_return_site_distances():
 		return_site_distances=True)
 
 	assert distances.shape == (1, 10)
+
+
+##
+
+
+def test_centrimo_control_sequences_differential():
+	n_seqs, seq_len = 200, 101
+	motif = one_hot_encode("ACGTACG")
+	w = motif.shape[-1]
+	center = (seq_len - w) // 2
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=10)
+	_plant(X, motif, [center] * 150)
+
+	# A control set where the motif is present just as often, but always at
+	# one of the two extreme ends rather than the center -- this is a much
+	# stronger test than a motif-free control, since it confirms the test
+	# distinguishes *where* matches fall rather than merely *whether* they
+	# exist (with a strict, exact-match-only threshold, a plain random
+	# background may by chance contribute zero qualifying control sites,
+	# which only demonstrates the degenerate n_control_sequences == 0 case
+	# covered by the threshold-exclusion design, not this comparison).
+	r = numpy.random.RandomState(11)
+	X_control = _make_one_hot((n_seqs, 4, seq_len), random_state=11)
+	offsets = r.choice([0, seq_len - w], size=150)
+	_plant(X_control, motif, offsets)
+
+	result = centrimo({'m1': motif.astype('float64')}, X,
+		control_sequences=X_control, threshold=0.001)
+
+	assert tuple(result.columns) == CONTROL_COLUMNS
+
+	row = result.iloc[0]
+	assert row['n_control_sequences'] >= 100
+	assert row['n_control_matching_sequences'] <= row['n_control_sequences']
+	assert row['fisher_e_value'] < 1e-10
+
+
+def test_centrimo_control_sequences_different_length():
+	# The primary and control sets need not match in length or count.
+	motif = one_hot_encode("ACGTACG")
+	w = motif.shape[-1]
+
+	X = _make_one_hot((100, 4, 101), random_state=12)
+	center = (101 - w) // 2
+	_plant(X, motif, [center] * 80)
+
+	X_control = _make_one_hot((50, 4, 61), random_state=13)
+
+	result = centrimo({'m1': motif.astype('float64')}, X,
+		control_sequences=X_control, threshold=0.001)
+
+	assert result.iloc[0]['n_control_sequences'] <= 50
+
+
+def test_centrimo_control_does_not_bias_window_selection():
+	# The enriched window is selected using the primary sequences alone, so
+	# a control set with the motif planted strongly off-center (which would
+	# pull the window elsewhere if it were allowed to influence selection)
+	# must not change the window chosen for the primary set.
+	n_seqs, seq_len = 200, 101
+	motif = one_hot_encode("ACGTACG")
+	w = motif.shape[-1]
+	center = (seq_len - w) // 2
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=14)
+	_plant(X, motif, [center] * 150)
+
+	result_alone = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001)
+
+	X_control = _make_one_hot((n_seqs, 4, seq_len), random_state=15)
+	_plant(X_control, motif, [5] * 150)
+
+	result_with_control = centrimo({'m1': motif.astype('float64')}, X,
+		control_sequences=X_control, threshold=0.001)
+
+	assert (result_alone.iloc[0]['best_window_width'] ==
+		result_with_control.iloc[0]['best_window_width'])
+	assert (result_alone.iloc[0]['n_matching_sequences'] ==
+		result_with_control.iloc[0]['n_matching_sequences'])
+
+
+def test_centrimo_control_return_site_distances():
+	motif = one_hot_encode("ACGTACG")
+	X = _make_one_hot((10, 4, 50), random_state=16)
+	X_control = _make_one_hot((8, 4, 50), random_state=17)
+
+	result, distances, control_distances = centrimo(
+		{'m1': motif.astype('float64')}, X, control_sequences=X_control,
+		return_site_distances=True)
+
+	assert distances.shape == (1, 10)
+	assert control_distances.shape == (1, 8)
+
+
+def test_centrimo_control_zero_sequences_raises():
+	motif = one_hot_encode("ACGTACG")
+	X = _make_one_hot((5, 4, 20), random_state=18)
+	X_control = numpy.zeros((0, 4, 20), dtype='int8')
+
+	assert_raises(ValueError, centrimo, {'m1': motif.astype('float64')}, X,
+		X_control)
+
+
+def test_centrimo_control_shorter_than_motif_raises():
+	motif = one_hot_encode("ACGTACGTAC")  # width 10
+	X = _make_one_hot((5, 4, 20), random_state=19)
+	X_control = _make_one_hot((5, 4, 5), random_state=20)
+
+	assert_raises(ValueError, centrimo, {'m1': motif.astype('float64')}, X,
+		X_control)
