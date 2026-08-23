@@ -150,6 +150,63 @@ def _all_pwm_to_mapping(motifs, motif_lengths, bin_size):
 	return smallests, logpdfs
 
 
+def _pvalue_score_thresholds(pwms_concat, lengths, bin_size, threshold):
+	"""Convert a p-value threshold into a per-motif raw score threshold.
+
+	This wraps `_all_pwm_to_mapping`'s score-to-p-value mapping, inverting it
+	to find, for each motif, the smallest raw score whose p-value is below
+	`threshold`. If no achievable score reaches `threshold`, that motif's
+	threshold is set to infinity (nothing can ever qualify).
+
+
+	Parameters
+	----------
+	pwms_concat: numpy.ndarray, shape=(len(alphabet), total_width)
+		The concatenated log-odds PWMs to threshold.
+
+	lengths: numpy.ndarray
+		The cumulative offsets demarcating each PWM's span within
+		`pwms_concat`. Has `len(pwms_concat's motifs) + 1` entries.
+
+	bin_size: float
+		The size of the bins discretizing the PWM scores, as in
+		`_all_pwm_to_mapping`.
+
+	threshold: float
+		The p-value threshold to convert.
+
+
+	Returns
+	-------
+	score_thresholds: numpy.ndarray, shape=(len(lengths) - 1,)
+		The raw score threshold for each motif.
+
+	smallest: numpy.ndarray
+		The per-motif bin offsets from `_all_pwm_to_mapping`, in case the
+		caller also needs to convert an arbitrary observed score back into a
+		p-value (e.g. to report which threshold an optimizing search chose).
+
+	score_to_pvals: list of numpy.ndarray
+		The per-motif score-bin-to-log2(p-value) mappings from
+		`_all_pwm_to_mapping`, for the same reason.
+	"""
+
+	log_threshold = math.log2(threshold)
+	smallest, score_to_pvals = _all_pwm_to_mapping(pwms_concat,
+		lengths.astype(numpy.uint64), bin_size)
+
+	n = len(lengths) - 1
+	score_thresholds = numpy.empty(n, dtype=numpy.float64)
+	for i in range(n):
+		idx = numpy.where(score_to_pvals[i] < log_threshold)[0]
+		if len(idx) > 0:
+			score_thresholds[i] = (idx[0] + smallest[i]) * bin_size
+		else:
+			score_thresholds[i] = float("inf")
+
+	return score_thresholds, smallest, score_to_pvals
+
+
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size, 
 	smallest, score_to_pvals, score_to_pval_lengths):

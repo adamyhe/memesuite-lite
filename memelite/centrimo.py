@@ -9,7 +9,7 @@ import scipy.stats
 
 from .io import read_meme
 from .io import _fasta_to_flat_array
-from .fimo import _all_pwm_to_mapping
+from .fimo import _pvalue_score_thresholds
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
@@ -479,17 +479,8 @@ def centrimo(motifs, sequences, control_sequences=None,
 	# Convert the p-value threshold to a per-motif raw score threshold. The
 	# same threshold is used for both strands since the reverse complement of
 	# a PWM has an identical score distribution under a uniform background.
-	log_threshold = math.log2(threshold)
-	_smallest, _score_to_pvals = _all_pwm_to_mapping(
-		log_pwm[:, :fwd_lengths[-1]], fwd_lengths.astype(numpy.uint64), bin_size)
-
-	score_thresholds = numpy.empty(n_motifs, dtype=numpy.float64)
-	for i in range(n_motifs):
-		idx = numpy.where(_score_to_pvals[i] < log_threshold)[0]
-		if len(idx) > 0:
-			score_thresholds[i] = (idx[0] + _smallest[i]) * bin_size
-		else:
-			score_thresholds[i] = float("inf")
+	score_thresholds, _smallest, _score_to_pvals = _pvalue_score_thresholds(
+		log_pwm[:, :fwd_lengths[-1]], fwd_lengths, bin_size, threshold)
 
 	# Extract the sequences, requiring that they all have the same length
 	X, n_seqs, seq_len = _load_sequences(sequences, alphabet, seqlen)
