@@ -9,7 +9,7 @@ import scipy.stats
 
 from .io import _fasta_to_flat_array
 from .io import _load_motifs
-from .fimo import _pvalue_score_thresholds
+from .utils import _pvalue_score_thresholds
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)

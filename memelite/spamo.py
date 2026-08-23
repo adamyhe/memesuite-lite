@@ -8,7 +8,7 @@ import pandas
 import scipy.stats
 
 from .io import _load_motifs
-from .fimo import _pvalue_score_thresholds
+from .utils import _pvalue_score_thresholds
 from .centrimo import _load_sequences
 
 
