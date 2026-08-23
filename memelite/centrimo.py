@@ -7,8 +7,8 @@ import numpy
 import pandas
 import scipy.stats
 
-from .io import read_meme
 from .io import _fasta_to_flat_array
+from .io import _load_motifs
 from .fimo import _pvalue_score_thresholds
 
 
@@ -145,12 +145,13 @@ def _load_sequences(sequences, alphabet, seqlen):
 	"""An internal function for loading a set of equal-length sequences.
 
 	This function accepts either a FASTA filepath or a one-hot numpy array
-	and returns the flat int8 representation `_centrimo_best_sites` expects,
-	along with the number and length of the sequences it contains. When
-	`sequences` is a FASTA filepath, only sequences matching `seqlen` (or the
-	length of the first sequence in the file, if `seqlen` is None) are kept,
-	mirroring the reference CentriMo binary's own default `--seqlen`
-	behavior rather than requiring the caller to pre-filter the file.
+	and returns a flat int8 representation (shared by `_centrimo_best_sites`
+	and `spamo`'s kernels), along with the number and length of the
+	sequences it contains. When `sequences` is a FASTA filepath, only
+	sequences matching `seqlen` (or the length of the first sequence in the
+	file, if `seqlen` is None) are kept, mirroring the reference CentriMo
+	binary's own default `--seqlen` behavior rather than requiring the
+	caller to pre-filter the file.
 	"""
 
 	if isinstance(sequences, str):
@@ -162,7 +163,7 @@ def _load_sequences(sequences, alphabet, seqlen):
 		n_dropped = len(seq_lens) - len(keep)
 
 		if n_dropped > 0:
-			print(f"centrimo: ignoring {n_dropped} sequence(s) not of length "
+			print(f"ignoring {n_dropped} sequence(s) not of length "
 				f"{target_len} (use `seqlen` to select a different length).")
 
 		seq_len = target_len
@@ -422,31 +423,13 @@ def centrimo(motifs, sequences, control_sequences=None,
 			'fisher_p_value', 'fisher_e_value']
 
 	# Extract the motifs
-	if isinstance(motifs, str):
-		motifs_ = read_meme(motifs)
-	elif isinstance(motifs, dict):
-		motifs_ = motifs
-	else:
-		raise ValueError("`motifs` must be a dict or a filename.")
-
-	names = list(motifs_.keys())
+	names, pwms = _load_motifs(motifs)
 	n_motifs = len(names)
 
 	if n_motifs == 0:
 		if n_jobs != -1:
 			numba.set_num_threads(_n_jobs)
 		return pandas.DataFrame(columns=columns)
-
-	pwms = []
-	for name in names:
-		pwm = motifs_[name]
-		if not isinstance(pwm, numpy.ndarray):
-			try:
-				pwm = pwm.numpy()
-			except:
-				raise ValueError(
-					f"`motifs` must be a dict[str, numpy.ndarray], not {type(pwm)}.")
-		pwms.append(pwm)
 
 	if separate_strands and reverse_complement:
 		# Expand each motif into its own forward and reverse complement

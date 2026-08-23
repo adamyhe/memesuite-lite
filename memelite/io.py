@@ -159,4 +159,57 @@ def write_meme(filename, motifs):
 				outfile.write("{} {} {} {}\n".format(*col))
 
 			outfile.write("URL BLANK\n\n")
-		
+
+
+def _load_motifs(motifs, param_name='motifs'):
+	"""An internal function for loading a dict of PWMs from a file or dict.
+
+	This method accepts either the filename of a MEME-formatted file (parsed
+	via `read_meme`) or a dict mapping motif names to PWMs, and returns
+	parallel lists of names and PWM arrays in a stable order. Each PWM in a
+	dict may be a numpy array directly, or any object exposing a `.numpy()`
+	method (e.g. a PyTorch tensor).
+
+
+	Parameters
+	----------
+	motifs: str or dict
+		A MEME file to load containing motifs, or a dictionary where the
+		keys are names of motifs and the values are PWMs with shape
+		(len(alphabet), pwm_length).
+
+	param_name: str, optional
+		The name to use for `motifs` in any raised error message, so that
+		callers with a differently-named parameter (e.g. `primary_motif`)
+		can produce an accurate message. Default is 'motifs'.
+
+
+	Returns
+	-------
+	names: list of str
+		The motif names, in the order they appear in `motifs`.
+
+	pwms: list of numpy.ndarray
+		The corresponding PWMs, each with shape (len(alphabet), pwm_length).
+	"""
+
+	if isinstance(motifs, str):
+		motifs_ = read_meme(motifs)
+	elif isinstance(motifs, dict):
+		motifs_ = motifs
+	else:
+		raise ValueError(f"`{param_name}` must be a dict or a filename.")
+
+	names = list(motifs_.keys())
+	pwms = []
+	for name in names:
+		pwm = motifs_[name]
+		if not isinstance(pwm, numpy.ndarray):
+			try:
+				pwm = pwm.numpy()
+			except:
+				raise ValueError(f"`{param_name}` must be a "
+					f"dict[str, numpy.ndarray], not {type(pwm)}.")
+		pwms.append(pwm)
+
+	return names, pwms
