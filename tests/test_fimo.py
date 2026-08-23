@@ -7,11 +7,11 @@ import numpy
 import pytest
 import pandas
 
-from memelite.fimo import _pwm_to_mapping
-from memelite.fimo import logaddexp2
 from memelite.fimo import fimo
 from memelite.io import read_meme
 from memelite.io import _fast_convert
+from memelite.utils import _pwm_to_mapping
+from memelite.utils import logaddexp2
 
 from numpy.testing import assert_raises
 from numpy.testing import assert_array_equal
