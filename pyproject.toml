@@ -39,4 +39,5 @@ dev = [
 [tool.pytest.ini_options]
 markers = [
     "cmd: tests that invoke the ttl command-line tool",
+    "meme_ref: tests that shell out to a real installed MEME suite binary for equivalence checking",
 ]

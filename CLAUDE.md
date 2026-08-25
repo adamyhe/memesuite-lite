@@ -17,9 +17,12 @@ uv run pytest tests/test_tomtom.py                    # run one test file
 uv run pytest tests/test_tomtom.py::test_tomtom_basic  # run one test
 uv run pytest -m "not cmd" # skip tests that shell out to the `ttl` CLI
 uv run pytest -m cmd       # run only the `ttl` CLI subprocess tests
+uv run pytest -m meme_ref  # run only the real-MEME-suite equivalence tests
 ```
 
 The `cmd`-marked tests (see `tests/test_cli.py`) invoke the installed `ttl` console script via `os.system`, so the package must be installed (e.g. `uv sync` / editable install) for them to pass — they aren't pure in-process unit tests.
+
+The `meme_ref`-marked tests (e.g. `tests/test_centrimo_equivalence.py`) shell out to a real, separately-installed MEME suite binary (e.g. `conda create -n meme-ref -c bioconda -c conda-forge meme=5.5.9`) to check this package's output against the reference implementation. They skip automatically (not via the `not cmd`-style marker exclusion) if the relevant binary isn't found on PATH, so `uv run pytest` always runs cleanly without one installed.
 
 There is no configured linter/formatter in this repo (flake8 is invoked in CI but with all checks commented out).
 
