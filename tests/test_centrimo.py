@@ -65,7 +65,7 @@ def test_centrimo_recovers_central_enrichment():
 	n_planted = 120
 	_plant(X, motif, [center] * n_planted)
 
-	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001)
+	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05)
 
 	assert tuple(result.columns) == COLUMNS
 	assert result.shape == (1, len(COLUMNS))
@@ -87,7 +87,7 @@ def test_centrimo_no_enrichment_uniform_random():
 	offsets = r.randint(0, seq_len - w + 1, size=n_planted)
 	_plant(X, motif, offsets)
 
-	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001)
+	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05)
 
 	row = result.iloc[0]
 	assert row['e_value'] > 0.01
@@ -107,9 +107,9 @@ def test_centrimo_reverse_complement():
 	n_planted = 120
 	_plant(X, rc_motif, [center] * n_planted)
 
-	with_rc = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001,
+	with_rc = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05,
 		reverse_complement=True)
-	without_rc = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001,
+	without_rc = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05,
 		reverse_complement=False)
 
 	assert with_rc.iloc[0]['e_value'] < 1e-10
@@ -146,7 +146,7 @@ def test_centrimo_below_threshold_excluded():
 	_plant(X, motif, [5])
 
 	result, distances = centrimo({'m1': motif.astype('float64')}, X,
-		threshold=0.001, return_site_distances=True)
+		threshold=0.05, return_site_distances=True)
 
 	assert result.iloc[0]['n_sequences'] == 1
 	assert not numpy.isnan(distances[0, 0])
@@ -191,7 +191,7 @@ def test_centrimo_meme_file_input():
 	motifs = read_meme("tests/data/test.meme")
 	X = _make_one_hot((20, 4, 150), random_state=6)
 
-	result = centrimo(motifs, X, threshold=0.001)
+	result = centrimo(motifs, X, threshold=0.05)
 
 	assert result.shape == (12, len(COLUMNS))
 	assert (result['p_value'] >= 0).all()
@@ -235,7 +235,7 @@ def test_centrimo_control_sequences_differential():
 	_plant(X_control, motif, offsets)
 
 	result = centrimo({'m1': motif.astype('float64')}, X,
-		control_sequences=X_control, threshold=0.001)
+		control_sequences=X_control, threshold=0.05)
 
 	assert tuple(result.columns) == CONTROL_COLUMNS
 
@@ -257,7 +257,7 @@ def test_centrimo_control_sequences_different_length():
 	X_control = _make_one_hot((50, 4, 61), random_state=13)
 
 	result = centrimo({'m1': motif.astype('float64')}, X,
-		control_sequences=X_control, threshold=0.001)
+		control_sequences=X_control, threshold=0.05)
 
 	assert result.iloc[0]['n_control_sequences'] <= 50
 
@@ -275,13 +275,13 @@ def test_centrimo_control_does_not_bias_window_selection():
 	X = _make_one_hot((n_seqs, 4, seq_len), random_state=14)
 	_plant(X, motif, [center] * 150)
 
-	result_alone = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001)
+	result_alone = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05)
 
 	X_control = _make_one_hot((n_seqs, 4, seq_len), random_state=15)
 	_plant(X_control, motif, [5] * 150)
 
 	result_with_control = centrimo({'m1': motif.astype('float64')}, X,
-		control_sequences=X_control, threshold=0.001)
+		control_sequences=X_control, threshold=0.05)
 
 	assert (result_alone.iloc[0]['best_window_width'] ==
 		result_with_control.iloc[0]['best_window_width'])
@@ -348,7 +348,7 @@ def test_centrimo_separate_strands_detects_correct_strand():
 	X = _make_one_hot((n_seqs, 4, seq_len), random_state=22)
 	_plant(X, rc_motif, [center] * 150)
 
-	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.001,
+	result = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05,
 		separate_strands=True)
 
 	fwd_row = result[result['motif_name'] == 'm1'].iloc[0]
@@ -399,8 +399,13 @@ def test_centrimo_optimize_score_finds_stricter_threshold():
 	X = _make_one_hot((n_seqs, 4, seq_len), random_state=30)
 	_plant(X, motif, [center] * 100)
 
-	default = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05)
-	optimized = centrimo({'m1': motif.astype('float64')}, X, threshold=0.05,
+	# A `threshold` this high is only "loose" once converted to CentriMo's
+	# per-sequence-adjusted p-value (divided by `2 * n_valid_positions`,
+	# `~190` here) -- it still comes out to a fairly strict effective
+	# per-position requirement, but loose enough to admit a lot of noise
+	# alongside the exact matches.
+	default = centrimo({'m1': motif.astype('float64')}, X, threshold=1.0)
+	optimized = centrimo({'m1': motif.astype('float64')}, X, threshold=1.0,
 		optimize_score=True)
 
 	assert tuple(optimized.columns) == COLUMNS + ('optimized_threshold_p_value',)
@@ -497,9 +502,10 @@ def test_centrimo_flip_negates_only_rc_row_distances():
 	_plant(X, rc_motif, [offset] * n_seqs)
 
 	no_flip, dist_no_flip = centrimo({'m1': motif.astype('float64')}, X,
-		separate_strands=True, return_site_distances=True)
+		threshold=0.05, separate_strands=True, return_site_distances=True)
 	flipped, dist_flip = centrimo({'m1': motif.astype('float64')}, X,
-		separate_strands=True, flip=True, return_site_distances=True)
+		threshold=0.05, separate_strands=True, flip=True,
+		return_site_distances=True)
 
 	# The forward row is untouched by `flip`.
 	assert_array_almost_equal(dist_no_flip[0], dist_flip[0])
