@@ -8,3 +8,4 @@ from .tomtom import tomtom
 from .symmetric_tomtom import symmetric_tomtom
 from .centrimo import centrimo
 from .spamo import spamo
+from .streme import streme

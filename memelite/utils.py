@@ -201,6 +201,315 @@ def _pvalue_score_thresholds(pwms_concat, lengths, bin_size, threshold):
 	return score_thresholds, smallest, score_to_pvals
 
 
+@numba.njit(parallel=True, cache=True)
+def _kmer_codes(X, X_lengths, w, alphabet_size):
+	"""An internal function for encoding every length-`w` window as an integer.
+
+	This function slides a width-`w` window across each sequence in a ragged
+	(flat + cumulative-offsets) sequence array and encodes each window as a
+	single base-`alphabet_size` integer (the same convention used everywhere
+	else in this package for reverse-complementing: alphabet index `i` and
+	`alphabet_size - 1 - i` are assumed to be complementary bases). Windows
+	containing an unknown/ignored base (-1) are left as -1 in the output
+	rather than being dropped, since dropping would require compacting the
+	output inside a parallel loop; callers should filter with `codes >= 0`.
+
+	This is a generic word-enumeration utility -- not specific to any one
+	algorithm -- so it lives here rather than in a specific module.
+
+
+	Parameters
+	----------
+	X: numpy.ndarray, shape=(-1,)
+		A flat int8 array of alphabet indexes (-1 for unknown characters) for
+		all sequences concatenated together. Sequences may have different
+		lengths.
+
+	X_lengths: numpy.ndarray, shape=(n_seqs+1,)
+		The cumulative offsets demarcating each sequence's span within `X`.
+
+	w: int
+		The window width to encode.
+
+	alphabet_size: int
+		The number of characters in the alphabet.
+
+
+	Returns
+	-------
+	codes: numpy.ndarray, shape=(total_windows,)
+		The integer code of each potential window, in sequence order, or -1
+		if that window contains an unknown character. `total_windows` is the
+		sum over all sequences of `max(0, length - w + 1)`.
+
+	owners: numpy.ndarray, shape=(total_windows,)
+		The index of the sequence each entry of `codes` belongs to.
+	"""
+
+	n_seqs = len(X_lengths) - 1
+
+	seq_lens = numpy.empty(n_seqs, dtype=numpy.int64)
+	for s in range(n_seqs):
+		seq_lens[s] = X_lengths[s + 1] - X_lengths[s]
+
+	n_windows = numpy.zeros(n_seqs, dtype=numpy.int64)
+	for s in range(n_seqs):
+		n_windows[s] = max(seq_lens[s] - w + 1, 0)
+
+	offsets = numpy.zeros(n_seqs + 1, dtype=numpy.int64)
+	for s in range(n_seqs):
+		offsets[s + 1] = offsets[s] + n_windows[s]
+
+	total = offsets[n_seqs]
+	codes = numpy.full(total, -1, dtype=numpy.int64)
+	owners = numpy.empty(total, dtype=numpy.int64)
+
+	for s in numba.prange(n_seqs):
+		base = X_lengths[s]
+		out0 = offsets[s]
+
+		for i in range(n_windows[s]):
+			owners[out0 + i] = s
+
+			code = 0
+			valid = True
+			for j in range(w):
+				idx = X[base + i + j]
+				if idx < 0:
+					valid = False
+					break
+				code = code * alphabet_size + idx
+
+			if valid:
+				codes[out0 + i] = code
+
+	return codes, owners
+
+
+def _reverse_complement_kmer_codes(codes, w, alphabet_size):
+	"""Compute the reverse-complement code of each `_kmer_codes` code.
+
+	Decodes each base-`alphabet_size` code into its `w` digits, reverses
+	their order, and complements each digit as `alphabet_size - 1 - digit`
+	(the same convention `_kmer_codes` and the rest of this package assume),
+	then re-encodes. Fully vectorized over `codes`.
+
+
+	Parameters
+	----------
+	codes: numpy.ndarray
+		Non-negative integer codes from `_kmer_codes` (callers should filter
+		out the -1 sentinel first).
+
+	w: int
+		The window width the codes were encoded with.
+
+	alphabet_size: int
+		The number of characters in the alphabet.
+
+
+	Returns
+	-------
+	rc_codes: numpy.ndarray
+		The reverse-complement code of each entry in `codes`.
+	"""
+
+	digits = numpy.empty((len(codes), w), dtype=numpy.int64)
+	remaining = codes.copy()
+	for j in range(w - 1, -1, -1):
+		digits[:, j] = remaining % alphabet_size
+		remaining //= alphabet_size
+
+	complements = alphabet_size - 1 - digits
+
+	rc_codes = numpy.zeros(len(codes), dtype=numpy.int64)
+	for j in range(w):
+		rc_codes = rc_codes * alphabet_size + complements[:, w - 1 - j]
+
+	return rc_codes
+
+
+@numba.njit(cache=True)
+def _markov_transition_probs(X, X_lengths, order, alphabet_size, eps):
+	"""An internal function for estimating an order-`m` Markov background.
+
+	Pools all given (ragged) sequences and estimates, with pseudocount
+	smoothing, the marginal (order-0) base frequency and, if `order` > 0, the
+	conditional probability of each base given the `order` preceding bases.
+	Used by `_markov_shuffle_sequences` to generate control sequences.
+
+
+	Parameters
+	----------
+	X: numpy.ndarray, shape=(-1,)
+		A flat int8 array of alphabet indexes (-1 for unknown characters) for
+		all sequences concatenated together.
+
+	X_lengths: numpy.ndarray, shape=(n_seqs+1,)
+		The cumulative offsets demarcating each sequence's span within `X`.
+
+	order: int
+		The Markov order `m`. 0 means an i.i.d. background (no context).
+
+	alphabet_size: int
+		The number of characters in the alphabet.
+
+	eps: float
+		A pseudocount added to every count before normalizing, to avoid zero
+		probabilities for contexts/bases never observed.
+
+
+	Returns
+	-------
+	marginal: numpy.ndarray, shape=(alphabet_size,)
+		The order-0 base frequency. Used as the model itself when `order` is
+		0, and to seed the first `order` bases of each shuffled sequence
+		(which have no preceding context yet) when `order` > 0.
+
+	transitions: numpy.ndarray, shape=(alphabet_size**order, alphabet_size)
+		Row `c` (a base-`alphabet_size`-encoded context of the `order`
+		preceding bases, in the same left-to-right digit order as
+		`_kmer_codes`) gives the conditional probability distribution of the
+		next base. Unused (shape (1, alphabet_size)) when `order` is 0.
+	"""
+
+	n_seqs = len(X_lengths) - 1
+
+	marginal_counts = numpy.full(alphabet_size, eps)
+	n_contexts = alphabet_size ** order if order > 0 else 1
+	trans_counts = numpy.full((n_contexts, alphabet_size), eps)
+
+	for s in range(n_seqs):
+		start, end = X_lengths[s], X_lengths[s + 1]
+
+		for i in range(start, end):
+			idx = X[i]
+			if idx != -1:
+				marginal_counts[idx] += 1
+
+		if order > 0:
+			for i in range(start + order, end):
+				context = 0
+				valid = True
+				for j in range(order):
+					c_idx = X[i - order + j]
+					if c_idx == -1:
+						valid = False
+						break
+					context = context * alphabet_size + c_idx
+
+				idx = X[i]
+				if valid and idx != -1:
+					trans_counts[context, idx] += 1
+
+	marginal = marginal_counts / marginal_counts.sum()
+
+	transitions = numpy.empty((n_contexts, alphabet_size))
+	for c in range(n_contexts):
+		total = trans_counts[c].sum()
+		for a in range(alphabet_size):
+			transitions[c, a] = trans_counts[c, a] / total
+
+	return marginal, transitions
+
+
+@numba.njit(cache=True)
+def _markov_shuffle_sequences(X_lengths, order, alphabet_size, marginal,
+	transitions, seed):
+	"""An internal function for sampling sequences from a Markov background.
+
+	Generates one new sequence per entry of `X_lengths` (same length as the
+	original), sampling each base from the order-`order` Markov chain defined
+	by `marginal`/`transitions` (see `_markov_transition_probs`). The first
+	`order` bases of each sequence have no preceding context yet, so they are
+	sampled from the order-0 `marginal` distribution instead -- a standard,
+	deliberately simple shortcut.
+
+	Note this is a probabilistic *resampling* from the estimated Markov
+	chain, not an exact letter-shuffle that preserves each individual
+	sequence's own k-mer counts exactly (which the reference MEME suite's
+	`fasta-shuffle-letters` does via a random Eulerian-circuit algorithm).
+	This is a deliberate simplification: it is a standard, much simpler
+	control-generation method that is good enough in practice, at the cost of
+	not being an exact permutation of each sequence's own letters.
+
+
+	Parameters
+	----------
+	X_lengths: numpy.ndarray, shape=(n_seqs+1,)
+		The cumulative offsets of the sequences to match the length of. Only
+		the lengths matter here, not the original content.
+
+	order: int
+		The Markov order `m` used to build `marginal`/`transitions`.
+
+	alphabet_size: int
+		The number of characters in the alphabet.
+
+	marginal: numpy.ndarray, shape=(alphabet_size,)
+		The order-0 base frequency, from `_markov_transition_probs`.
+
+	transitions: numpy.ndarray, shape=(alphabet_size**order, alphabet_size)
+		The order-`order` conditional base distribution, from
+		`_markov_transition_probs`.
+
+	seed: int
+		A seed for numba's internal random number generator, for
+		reproducibility.
+
+
+	Returns
+	-------
+	X: numpy.ndarray, shape=(X_lengths[-1],)
+		The flat int8 array of the newly sampled sequences, using the same
+		cumulative offsets as `X_lengths`.
+	"""
+
+	numpy.random.seed(seed)
+
+	n_seqs = len(X_lengths) - 1
+	out = numpy.empty(X_lengths[n_seqs], dtype=numpy.int8)
+
+	cum_marginal = numpy.cumsum(marginal)
+	cum_marginal[alphabet_size - 1] = 1.0
+
+	n_contexts = transitions.shape[0]
+	cum_transitions = numpy.empty((n_contexts, alphabet_size))
+	for c in range(n_contexts):
+		acc = 0.0
+		for a in range(alphabet_size):
+			acc += transitions[c, a]
+			cum_transitions[c, a] = acc
+		cum_transitions[c, alphabet_size - 1] = 1.0
+
+	for s in range(n_seqs):
+		start, end = X_lengths[s], X_lengths[s + 1]
+
+		context = 0
+		for i in range(end - start):
+			if order == 0 or i < order:
+				u = numpy.random.random()
+				base = alphabet_size - 1
+				for a in range(alphabet_size):
+					if u <= cum_marginal[a]:
+						base = a
+						break
+			else:
+				u = numpy.random.random()
+				base = alphabet_size - 1
+				for a in range(alphabet_size):
+					if u <= cum_transitions[context, a]:
+						base = a
+						break
+
+			out[start + i] = base
+
+			if order > 0:
+				context = (context * alphabet_size + base) % (alphabet_size ** order)
+
+	return out
+
+
 def characters(pwm, alphabet=['A', 'C', 'G', 'T'], force=False, allow_N=False):
 	"""Converts a PWM/one-hot encoding to a string sequence.
 
@@ -331,7 +640,7 @@ def one_hot_encode(sequence, alphabet=['A', 'C', 'G', 'T'], dtype=numpy.int8,
 
 	for char in ignore:
 		if char in alphabet:
-			raise ValueError("Character {} in the alphabet ".format(char) + 
+			raise ValueError(f"Character {char} in the alphabet " +
 				"and also in the list of ignored characters.")
 
 	if isinstance(alphabet, list):

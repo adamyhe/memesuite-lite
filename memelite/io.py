@@ -68,6 +68,81 @@ def _fasta_to_flat_array(filename, alphabet=['A', 'C', 'G', 'T']):
 	return names, X, X_lengths
 
 
+def _load_ragged_sequences(sequences, alphabet=['A', 'C', 'G', 'T']):
+	"""An internal function for loading a set of variable-length sequences.
+
+	This is a variable-length analogue of `centrimo._load_sequences` (which
+	hard-assumes every sequence has the same length, and so can't be reused
+	by tools like `streme` that operate on sequences of differing lengths).
+	Accepts a FASTA filepath (delegated straight to `_fasta_to_flat_array`),
+	a list of one-hot `numpy.ndarray`s (each shape (len(alphabet), length),
+	lengths may differ), or a list of plain strings. Returns the same flat
+	int8 + cumulative-offsets representation `_fasta_to_flat_array` already
+	uses, so it composes directly with it and with any ragged-sequence numba
+	kernel written against that convention.
+
+
+	Parameters
+	----------
+	sequences: str or list
+		A FASTA filepath, or a list of one-hot numpy arrays (or objects
+		exposing a `.numpy()` method, e.g. torch tensors) or plain strings.
+
+	alphabet: list, optional
+		A list of characters to use for the alphabet, defining the order that
+		characters should appear. Default is ['A', 'C', 'G', 'T'].
+
+
+	Returns
+	-------
+	names: numpy.ndarray
+		The names of the sequences, in order. For FASTA input these come from
+		the file; otherwise they are just the sequence's index as a string.
+
+	X: numpy.ndarray, shape=(-1,)
+		A flat int8 array of alphabet indexes for all sequences concatenated
+		together.
+
+	X_lengths: numpy.ndarray, shape=(len(names)+1,)
+		The cumulative offsets demarcating each sequence's span within `X`.
+	"""
+
+	if isinstance(sequences, str):
+		return _fasta_to_flat_array(sequences, alphabet)
+
+	if len(sequences) == 0:
+		return (numpy.array([], dtype=str), numpy.array([], dtype=numpy.int8),
+			numpy.array([0], dtype=numpy.int64))
+
+	alphabet_str = ''.join(alphabet)
+	alpha_idxs = numpy.frombuffer(bytearray(alphabet_str, 'utf8'), dtype=numpy.int8)
+	one_hot_mapping = numpy.zeros(256, dtype=numpy.int8) - 1
+	for i, idx in enumerate(alpha_idxs):
+		one_hot_mapping[idx] = i
+
+	X, lengths = [], [0]
+	for seq in sequences:
+		if isinstance(seq, str):
+			seq_idxs = numpy.frombuffer(bytearray(seq.upper(), 'utf8'),
+				dtype=numpy.int8)
+			_fast_convert(seq_idxs, one_hot_mapping)
+			x = seq_idxs
+		else:
+			if not isinstance(seq, numpy.ndarray):
+				seq = seq.numpy()
+
+			x = ((seq.argmax(axis=0) + 1) * seq.sum(axis=0)) - 1
+			x = x.astype(numpy.int8)
+
+		lengths.append(lengths[-1] + len(x))
+		X.append(x)
+
+	names = numpy.array([str(i) for i in range(len(sequences))])
+	X = numpy.concatenate(X).astype(numpy.int8)
+	X_lengths = numpy.array(lengths, dtype=numpy.int64)
+	return names, X, X_lengths
+
+
 def read_meme(filename, n_motifs=None):
 	"""Read a MEME file and return a dictionary of PWMs.
 
