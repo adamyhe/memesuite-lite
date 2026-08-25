@@ -16,9 +16,9 @@ from numpy.testing import assert_array_equal
 from numpy.testing import assert_array_almost_equal
 
 
-COLUMNS = ('motif_name', 'motif_idx', 'width', 'strand', 'n_sequences',
-	'n_bins_tested', 'best_offset_lo', 'best_offset_hi',
-	'n_matching_sequences', 'p_value', 'e_value')
+COLUMNS = ('motif_name', 'motif_idx', 'width', 'orientation', 'n_sequences',
+	'n_bins_tested', 'gap_lo', 'gap_hi', 'n_matching_sequences', 'p_value',
+	'adj_p_value', 'e_value')
 
 
 def _make_one_hot(shape, random_state=None):
@@ -50,9 +50,14 @@ def _plant(X, motif, offsets):
 	return X
 
 
-def _row(result, name, strand):
+def _row(result, name, orientation):
 	return result[(result['motif_name'] == name) &
-		(result['strand'] == strand)].iloc[0]
+		(result['orientation'] == orientation)].iloc[0]
+
+
+def _has_row(result, name, orientation):
+	return ((result['motif_name'] == name) &
+		(result['orientation'] == orientation)).any()
 
 
 ###
@@ -62,7 +67,7 @@ def test_spamo_recovers_known_offset_downstream_same_strand():
 	n_seqs, seq_len = 300, 500
 	primary = one_hot_encode("ACGTGCA")
 	secondary = one_hot_encode("TTGCCAA")
-	w_p, w_s = primary.shape[-1], secondary.shape[-1]
+	w_p = primary.shape[-1]
 
 	primary_pos = 246
 	gap = 20
@@ -76,22 +81,24 @@ def test_spamo_recovers_known_offset_downstream_same_strand():
 		{'s1': secondary.astype('float64')}, X, threshold=0.001)
 
 	assert tuple(result.columns) == COLUMNS
-	assert result.shape == (2, len(COLUMNS))
 
-	same = _row(result, 's1', 'same')
-	opposite = _row(result, 's1', 'opposite')
+	row = _row(result, 's1', 'downstream_same')
+	assert row['n_matching_sequences'] >= 0.9 * 150
+	assert row['gap_lo'] <= gap <= row['gap_hi']
+	assert row['e_value'] < 1e-10
 
-	assert same['n_matching_sequences'] >= 0.9 * 150
-	assert same['best_offset_lo'] <= gap + 1 <= same['best_offset_hi']
-	assert same['e_value'] < 1e-10
-	assert opposite['e_value'] > 0.01
+	# Only quadrant 1 (downstream, same strand) has any signal, so the
+	# categories built purely from other quadrants must not appear.
+	assert not _has_row(result, 's1', 'upstream_same')
+	assert not _has_row(result, 's1', 'upstream_opposite')
+	assert not _has_row(result, 's1', 'downstream_opposite')
 
 
 def test_spamo_recovers_known_offset_upstream():
 	n_seqs, seq_len = 300, 500
 	primary = one_hot_encode("ACGTGCA")
 	secondary = one_hot_encode("TTGCCAA")
-	w_p, w_s = primary.shape[-1], secondary.shape[-1]
+	w_s = secondary.shape[-1]
 
 	primary_pos = 246
 	gap = 15
@@ -104,12 +111,11 @@ def test_spamo_recovers_known_offset_upstream():
 	result = spamo({'p1': primary.astype('float64')},
 		{'s1': secondary.astype('float64')}, X, threshold=0.001)
 
-	same = _row(result, 's1', 'same')
-
-	assert same['n_matching_sequences'] >= 0.9 * 150
-	assert same['best_offset_lo'] <= -(gap + 1) <= same['best_offset_hi']
-	assert same['best_offset_hi'] < 0
-	assert same['e_value'] < 1e-10
+	row = _row(result, 's1', 'upstream_same')
+	assert row['n_matching_sequences'] >= 0.9 * 150
+	assert row['gap_lo'] <= gap <= row['gap_hi']
+	assert row['e_value'] < 1e-10
+	assert not _has_row(result, 's1', 'downstream_same')
 
 
 def test_spamo_same_vs_opposite_strand_discrimination():
@@ -131,15 +137,127 @@ def test_spamo_same_vs_opposite_strand_discrimination():
 	result = spamo({'p1': primary.astype('float64')},
 		{'s1': secondary.astype('float64')}, X, threshold=0.001)
 
-	same = _row(result, 's1', 'same')
-	opposite = _row(result, 's1', 'opposite')
-
-	assert opposite['e_value'] < 1e-10
-	assert opposite['n_matching_sequences'] >= 0.9 * 150
-	assert same['e_value'] > 0.01
+	row = _row(result, 's1', 'downstream_opposite')
+	assert row['n_matching_sequences'] >= 0.9 * 150
+	assert row['e_value'] < 1e-10
+	assert not _has_row(result, 's1', 'downstream_same')
 
 
-def test_spamo_no_signal_uniform_random_offset():
+def test_spamo_side_rotates_with_primary_strand():
+	# The primary is planted on the reverse-complement strand. A secondary
+	# site placed literally *before* the primary in raw sequence
+	# coordinates should be reported as "downstream" once rotated into the
+	# primary's own (reverse) reading direction, not "upstream" -- this is
+	# the side-rotation behavior confirmed against `bin_matches` in the
+	# reference binary's C source (src/spamo-matches.c).
+	n_seqs, seq_len = 300, 500
+	primary_seq, secondary_seq = "ACGTGCA", "TTGCCAA"
+	primary = one_hot_encode(primary_seq)
+	rc_primary = one_hot_encode(_reverse_complement_str(primary_seq))
+	secondary = one_hot_encode(secondary_seq)
+	rc_secondary = one_hot_encode(_reverse_complement_str(secondary_seq))
+	w_s = secondary.shape[-1]
+
+	primary_pos = 246
+	gap = 20
+	secondary_pos = primary_pos - gap - w_s
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=40)
+	_plant(X, rc_primary, [primary_pos] * n_seqs)
+	_plant(X, rc_secondary, [secondary_pos] * 150)
+
+	result = spamo({'p1': primary.astype('float64')},
+		{'s1': secondary.astype('float64')}, X, threshold=0.001)
+
+	row = _row(result, 's1', 'downstream_same')
+	assert row['n_matching_sequences'] >= 0.9 * 150
+	assert row['gap_lo'] <= gap <= row['gap_hi']
+	assert not _has_row(result, 's1', 'upstream_same')
+
+
+def test_spamo_pooled_secondary_pal_orientation():
+	# Half the sequences have the secondary matching the forward strand
+	# downstream of the primary; the other half have its reverse complement
+	# at the same gap and side. Neither raw quadrant alone has the full
+	# signal, but `downstream_secondary_pal` (which pools both strands on
+	# the downstream side) should recover it clearly.
+	n_seqs, seq_len = 400, 500
+	primary = one_hot_encode("ACGTGCA")
+	secondary_seq = "TTGCCAA"
+	secondary = one_hot_encode(secondary_seq)
+	rc_secondary = one_hot_encode(_reverse_complement_str(secondary_seq))
+	w_p = primary.shape[-1]
+
+	primary_pos = 246
+	gap = 20
+	secondary_pos = primary_pos + w_p + gap
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=42)
+	_plant(X, primary, [primary_pos] * n_seqs)
+	# Plant the forward copy of the secondary in sequences [0, 100) and the
+	# rc copy in a disjoint block [100, 200), both at the same gap/side.
+	_plant(X[:100], secondary, [secondary_pos] * 100)
+	_plant(X[100:200], rc_secondary, [secondary_pos] * 100)
+
+	result = spamo({'p1': primary.astype('float64')},
+		{'s1': secondary.astype('float64')}, X, threshold=0.001)
+
+	pooled = _row(result, 's1', 'downstream_secondary_pal')
+	assert pooled['n_matching_sequences'] >= 190
+	assert pooled['e_value'] < 1e-10
+
+
+def test_spamo_leftover_bin_boundaries():
+	n_seqs, seq_len = 300, 200
+	primary = one_hot_encode("ACGTGCA")
+	secondary = one_hot_encode("TTGCCAA")
+	w_p, w_s = primary.shape[-1], secondary.shape[-1]
+
+	margin, bin_size_bp = 25, 5
+	# quad_opt_count = margin - w_s + 1 = 19; 19 % 5 = 4, so the leftover
+	# bin covers gaps [15, 18] -- narrower than a full bin_size_bp=5 bin.
+	primary_pos = 90
+	gap = 17
+	secondary_pos = primary_pos + w_p + gap
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=41)
+	_plant(X, primary, [primary_pos] * n_seqs)
+	_plant(X, secondary, [secondary_pos] * 200)
+
+	result = spamo({'p1': primary.astype('float64')},
+		{'s1': secondary.astype('float64')}, X, margin=margin,
+		range_=margin, bin_size_bp=bin_size_bp, threshold=0.001)
+
+	row = _row(result, 's1', 'downstream_same')
+	assert row['gap_lo'] == 15
+	assert row['gap_hi'] == 18
+
+
+def test_spamo_no_signal_omits_secondary_motif():
+	n_seqs, seq_len = 300, 500
+	primary = one_hot_encode("ACGTGCA")
+	secondary = one_hot_encode("TTGCCAA")
+	w_p, w_s = primary.shape[-1], secondary.shape[-1]
+
+	r = numpy.random.RandomState(3)
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=3)
+	_plant(X, primary, [246] * n_seqs)
+
+	offsets = r.randint(246 + w_p, seq_len - w_s, size=150)
+	_plant(X, secondary, offsets)
+
+	# The default `evalue_threshold` (10.0, matching the reference binary's
+	# own generous default) is loose enough that even random noise's best
+	# bin usually still gets reported as a fallback -- use a strict
+	# `evalue_threshold` to directly exercise the "omitted entirely" path.
+	result = spamo({'p1': primary.astype('float64')},
+		{'s1': secondary.astype('float64')}, X, threshold=0.001,
+		evalue_threshold=1e-6)
+
+	assert result[result['motif_name'] == 's1'].empty
+
+
+def test_spamo_no_signal_reports_fallback_row_at_default_evalue():
 	n_seqs, seq_len = 300, 500
 	primary = one_hot_encode("ACGTGCA")
 	secondary = one_hot_encode("TTGCCAA")
@@ -155,8 +273,13 @@ def test_spamo_no_signal_uniform_random_offset():
 	result = spamo({'p1': primary.astype('float64')},
 		{'s1': secondary.astype('float64')}, X, threshold=0.001)
 
-	same = _row(result, 's1', 'same')
-	assert same['e_value'] > 0.01
+	# At the default (loose) evalue_threshold, exactly one fallback row is
+	# reported, and it is not independently significant (its own
+	# adj_p_value is above `cutoff` -- that's precisely why it's a
+	# fallback rather than one of possibly-several significant rows).
+	sub = result[result['motif_name'] == 's1']
+	assert len(sub) == 1
+	assert sub.iloc[0]['adj_p_value'] > 0.05
 
 
 def test_spamo_reverse_complement_primary():
@@ -259,9 +382,11 @@ def test_spamo_fasta_seqlen_filter(tmp_path):
 
 	result = spamo({'p1': primary.astype('float64')},
 		{'s1': secondary.astype('float64')}, str(fasta_path), threshold=0.001)
-	row = _row(result, 's1', 'same')
-	assert row['n_sequences'] <= 2
-	assert row['n_matching_sequences'] >= 1
+
+	sub = result[result['motif_name'] == 's1']
+	assert not sub.empty
+	assert (sub['n_sequences'] <= 2).all()
+	assert (sub['n_matching_sequences'] >= 1).all()
 
 
 def test_spamo_return_site_positions():
@@ -292,10 +417,10 @@ def test_spamo_meme_file_input():
 
 	result = spamo(primary, secondary, X, threshold=0.01)
 
-	assert result.shape == (2 * len(secondary), len(COLUMNS))
+	assert tuple(result.columns) == COLUMNS
 	assert (result['p_value'] >= 0).all()
 	assert (result['p_value'] <= 1).all()
-	assert (result['e_value'] >= 0).all()
+	assert (result['adj_p_value'] >= result['p_value']).all()
 
 
 def test_spamo_evalue_formula():
@@ -314,9 +439,19 @@ def test_spamo_evalue_formula():
 	result = spamo({'p1': primary.astype('float64')}, secondary_pwms, X,
 		threshold=0.001)
 
-	for _, row in result.iterrows():
-		expected = min(row['p_value'] * row['n_bins_tested'] * 2 * 2, 1.0)
-		assert abs(row['e_value'] - expected) < 1e-12
+	# `e_value` is a motif-level quantity: constant across every row of a
+	# given secondary motif, and equal to the *smallest* adj_p_value among
+	# its reported rows times the number of secondary motifs (the globally
+	# best (orientation, bin) is always one of the reported rows whenever
+	# any row is reported at all, since reporting requires adj_p_value <=
+	# cutoff, and the global minimum is <= any value that already cleared
+	# cutoff).
+	n_motifs = len(secondary_pwms)
+	for name in result['motif_name'].unique():
+		sub = result[result['motif_name'] == name]
+		assert (sub['e_value'] == sub['e_value'].iloc[0]).all()
+		expected = sub['adj_p_value'].min() * n_motifs
+		assert abs(sub['e_value'].iloc[0] - expected) < 1e-9
 
 
 ##

@@ -12,6 +12,29 @@ from .utils import _pvalue_score_thresholds
 from .centrimo import _load_sequences
 
 
+# The 9 "biologically interesting" orientation categories from the reference
+# SpaMo binary (src/spamo-matches.c): the 4 raw quadrants (upstream/
+# downstream x same/opposite strand, relative to the primary's own matched
+# strand) plus 5 combinations that pool pairs of quadrants together to stay
+# significant even if a motif's actual strand identity doesn't matter
+# biologically (e.g. because it's palindromic). The raw-quadrant index
+# order here (quad = 2*side + strand, side the high bit) and the pairing of
+# quadrants into each combined category were confirmed empirically against
+# the real binary (v5.5.9) -- the source's own `#define`/arithmetic reads as
+# the opposite bit order, but doesn't reproduce the binary's actual reported
+# orientation for a given planted signal; a set of controlled probes (each
+# varying exactly one of side/strand/primary-strand) resolved the true
+# mapping unambiguously. Used only when `reverse_complement` is True;
+# `_ORIENTATION_NAMES_NORC` is used otherwise, since there is then no strand
+# distinction to make at all.
+_ORIENTATION_NAMES_RC = (
+	'upstream_same', 'upstream_opposite', 'downstream_same', 'downstream_opposite',
+	'upstream_secondary_pal', 'upstream_primary_pal', 'downstream_primary_pal',
+	'downstream_secondary_pal', 'both_pal',
+)
+_ORIENTATION_NAMES_NORC = ('upstream', 'downstream')
+
+
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _spamo_primary_sites(X, n_seqs, seq_len, pwm_fwd, pwm_rc, w_p,
 	score_threshold, margin, reverse_complement):
@@ -252,9 +275,10 @@ def _spamo_secondary_sites(X, n_seqs, seq_len, primary_positions,
 
 
 def spamo(primary_motif, secondary_motifs, sequences,
-	alphabet=('A', 'C', 'G', 'T'), margin=150, range_=None, bin_size_bp=1,
-	bin_size=0.1, eps=0.0001, threshold=0.001, reverse_complement=True,
-	seqlen=None, return_site_positions=False, n_jobs=-1):
+	alphabet=('A', 'C', 'G', 'T'), margin=150, range_=150, bin_size_bp=1,
+	bin_size=0.1, eps=0.0001, threshold=0.001, cutoff=0.05,
+	evalue_threshold=10.0, reverse_complement=True, seqlen=None,
+	return_site_positions=False, n_jobs=-1):
 	"""An implementation of the SpaMo algorithm from the MEME suite.
 
 	This function implements the "Spaced Motif Analysis" (SpaMo) algorithm
@@ -267,52 +291,71 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	constraints (motif "syntax"), e.g. between motifs pulled out of a
 	machine learning model's attributions.
 
-	For each sequence, the primary motif's single best site is found within
-	the *central* region only (excluding `margin` bp from each edge, so a
-	full flanking window always fits around wherever it lands). For each
+	Algorithm (verified against the real MEME suite v5.5.9 C source,
+	`src/spamo-matches.c`/`src/spamo.c`, not just the docs/paper): for each
+	sequence, the primary motif's single best site is found within the
+	*central* region only (excluding `margin` bp from each edge, so a full
+	flanking window always fits around wherever it lands). For each
 	sequence with a qualifying primary site, each secondary motif's single
 	best site is then found within `margin` bp on either side of the
 	primary site, excluding the primary's own span (the two sites can never
-	overlap). The signed offset `f` between the two sites is computed as
-	`f = -(D+1)` if the secondary is 5' (upstream) of the primary, else
-	`f = D+1`, where `D` is the gap in bp between the closest edges of the
-	two sites (so `f` is never 0). Sequences are split into two entirely
-	independent groups per secondary motif -- "same strand" and "opposite
-	strand", depending on whether the primary and secondary sites landed on
-	the same strand -- each with its own histogram and test, since this is
-	itself an interesting distinction (some interactions are orientation-
-	specific) and not just a nuisance to average over.
+	overlap). Each such pair is classified into one of 4 base quadrants --
+	upstream/downstream (relative to the *primary's own matched strand*,
+	i.e. rotated 180 degrees when the primary matched on the reverse
+	strand) crossed with same/opposite strand -- and its gap `D` (the
+	number of bp between the two sites' closest edges, counting from 0) is
+	binned into `bin_size_bp`-wide bins ranging over `[0, margin - w_s)`
+	(`w_s` = the secondary motif's width).
 
-	For each `(secondary motif, strand category)`, a one-sided binomial test
-	is run for every bin of width `bin_size_bp` within `range_` bp on either
-	side of the primary (`N` = sequences with a valid offset in that
-	category, `s` = count in a bin, `q = bin_size_bp / (2r+1)` where
-	`r = (2*margin - w_p - w_s)/2` is a uniform-null probability -- the same
-	idea as `centrimo`'s `p_null`). Because `q` is identical for every bin
-	here (fixed width, fixed `N`), the bin with the highest count is always
-	the most significant one, so only a single `scipy.stats.binom.sf` call
-	is needed per `(secondary motif, strand category)`, unlike `centrimo`'s
-	window-width search. The reported E-value Bonferroni-corrects for the
-	number of bins tested, the two strand categories, and the number of
-	secondary motifs.
+	Each of the 4 quadrants is tested independently at every bin, plus 5
+	further categories that pool pairs of quadrants together so that a
+	spacing constraint involving a motif that behaves symmetrically with
+	respect to strand (e.g. because it's palindromic, or simply because the
+	orientation doesn't matter biologically) isn't missed by requiring a
+	specific strand match: `upstream_secondary_pal`/`downstream_secondary_pal`
+	(pool both strands on one side), `upstream_primary_pal`/
+	`downstream_primary_pal` (pool the two "diagonal" quadrant pairs), and
+	`both_pal` (all 4 quadrants). All 9 categories share **one** binomial
+	test denominator `N` (every sequence with a qualifying primary+secondary
+	pair, regardless of which quadrant it landed in) and a null probability
+	proportional to how much of the total 4-quadrant space that bin/category
+	covers -- not two independent same-strand/opposite-strand tests with
+	separate `N`s, which is what this package's implementation did before
+	this was corrected against source. Every `(orientation, bin)` p-value is
+	Bonferroni-corrected (`adj_p_value`) by the number of orientation
+	categories (9, or 2 if `reverse_complement` is False) times the number
+	of bins tested (bounded by `range_`); a further, *separate* correction
+	by the number of secondary motifs gives the motif-level `e_value`.
+
+	A secondary motif's rows are: every `(orientation, bin)` whose
+	`adj_p_value` is at or below `cutoff`; or, if none qualify but the
+	motif's own `e_value` is at or below `evalue_threshold`, just the single
+	best `(orientation, bin)` as a fallback; or no rows at all if neither
+	holds -- so, unlike most other functions in this package, secondary
+	motifs found to be non-enriched are omitted from the output entirely
+	rather than reported as an all-zero row (matching the reference
+	binary's own behavior exactly).
 
 	Only the best secondary site per sequence is used (matching the
 	reference SpaMo binary's `-usebestsec` option, but as the *only*
 	behavior here rather than a non-default flag): the underlying binomial
-	test assumes exactly one offset value per sequence, which is only
-	statistically valid under best-site semantics -- the reference binary's
-	default "count all matches above threshold" mode would let one sequence
-	contribute multiple offsets, violating that assumption. This mirrors
-	`centrimo`'s identical, previously-made choice in this package.
+	test assumes exactly one gap value per sequence per quadrant, which is
+	only statistically valid under best-site semantics -- the reference
+	binary's default "count all matches above threshold" mode would let one
+	sequence contribute multiple gaps, violating that assumption. This
+	mirrors `centrimo`'s identical, previously-made choice in this package.
 
-	Also not implemented: `-trim` (motif-edge information-content trimming
-	-- apply it to your PWMs yourself before calling `spamo`, if wanted),
+	Not implemented: `-trim` (motif-edge information-content trimming --
+	apply it to your PWMs yourself before calling `spamo`, if wanted),
 	`-shared`/`-overlap`/`-joint` (secondary-motif redundancy clustering),
-	multiple named secondary-motif databases (pass one flat dict), and
-	`-dumpseqs`. As in `fimo`/`centrimo`, `threshold` is a p-value (applied
-	to both the primary and secondary motifs), converted internally to a raw
-	score threshold, rather than the reference binary's fixed-bits
-	`-minscore`.
+	multiple named secondary-motif databases (pass one flat dict),
+	`-dumpseqs`, and `-keepprimary`'s erasure of "extra" occurrences of the
+	primary motif elsewhere in a sequence (the reference binary does this by
+	default; for equivalence testing, pass `-keepprimary` to the reference
+	binary to disable it instead). As in `fimo`/`centrimo`, `threshold` is a
+	p-value (applied to both the primary and secondary motifs), converted
+	internally to a raw score threshold, rather than the reference binary's
+	fixed-bits `-minscore`.
 
 
 	Parameters
@@ -341,16 +384,18 @@ def spamo(primary_motif, secondary_motifs, sequences,
 		scanning for the primary site, and the radius (in bp) on either side
 		of the primary site to search for secondary sites. Default is 150.
 
-	range_: int or None, optional
+	range_: int, optional
 		How far out (bp, on either side of the primary site) the candidate
-		offset bins for the significance search extend. If None, uses
-		`margin`. Sequences with an offset beyond `range_` (but still within
-		`margin`) still count toward a motif's `n_sequences`, but are not
-		considered when searching for the most significant bin. Default is
-		None.
+		gap bins for the significance search extend. Sequences with a gap
+		beyond `range_` (but still within `margin`) still count toward a
+		motif's `n_sequences` and contribute to a bin's count, but are not
+		considered when searching for the most significant bin. Deliberately
+		*not* tied to `margin` by default (matching the reference binary,
+		which has an independent, fixed default here rather than deriving
+		it from `-margin`). Default is 150.
 
 	bin_size_bp: int, optional
-		The width, in bp, of each candidate offset bin. Default is 1.
+		The width, in bp, of each candidate gap bin. Default is 1.
 
 	bin_size: float, optional
 		The size of the bins discretizing PWM scores when converting the
@@ -364,6 +409,18 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	threshold: float, optional
 		The p-value threshold a site (primary or secondary) must reach to
 		qualify. Default is 0.001.
+
+	cutoff: float, optional
+		The (Bonferroni-corrected) p-value a single `(orientation, bin)`
+		must reach to be reported as its own row, mirroring the reference
+		binary's `-cutoff`. Default is 0.05.
+
+	evalue_threshold: float, optional
+		The motif-level E-value a secondary motif's best `(orientation,
+		bin)` must reach for that motif to be reported at all (as a
+		fallback single row, if no individual bin/orientation reached
+		`cutoff`), mirroring the reference binary's `-evalue`. Default is
+		10.0.
 
 	reverse_complement: bool, optional
 		Whether to also score the reverse complement strand at each
@@ -388,10 +445,16 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	Returns
 	-------
 	results: pandas.DataFrame
-		A dataframe with two rows per secondary motif (`strand` == 'same'
-		then 'opposite'), containing the number of sequences used, the most
-		significant offset bin found, and the corresponding enrichment
-		statistics.
+		A dataframe with 0 to 9 rows per secondary motif (see above for
+		when a motif is omitted, and when it gets multiple rows), columns
+		`motif_name, motif_idx, width, orientation, n_sequences,
+		n_bins_tested, gap_lo, gap_hi, n_matching_sequences, p_value,
+		adj_p_value, e_value`. `orientation` is one of the 9 (or 2, if
+		`reverse_complement` is False) category names described above.
+		`gap_lo`/`gap_hi` are the inclusive bp range (edge-to-edge, always
+		non-negative) of the reported bin. `e_value` is a motif-level
+		quantity, identical across every row belonging to the same
+		secondary motif.
 
 	primary_positions: numpy.ndarray, shape=(n_sequences,), optional
 	primary_strands: numpy.ndarray, shape=(n_sequences,), optional
@@ -406,12 +469,9 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	else:
 		n_jobs = _n_jobs = numba.get_num_threads()
 
-	if range_ is None:
-		range_ = margin
-
-	columns = ['motif_name', 'motif_idx', 'width', 'strand', 'n_sequences',
-		'n_bins_tested', 'best_offset_lo', 'best_offset_hi',
-		'n_matching_sequences', 'p_value', 'e_value']
+	columns = ['motif_name', 'motif_idx', 'width', 'orientation', 'n_sequences',
+		'n_bins_tested', 'gap_lo', 'gap_hi', 'n_matching_sequences', 'p_value',
+		'adj_p_value', 'e_value']
 
 	# Load the primary motif -- must resolve to exactly one entry.
 	primary_names, primary_pwms = _load_motifs(primary_motif, 'primary_motif')
@@ -474,12 +534,12 @@ def spamo(primary_motif, secondary_motifs, sequences,
 			f"not fit within the central region after excluding `margin` "
 			f"({margin}) from each edge of a sequence of length {seq_len}.")
 
-	r = (2 * margin - w_p - secondary_widths) / 2.0
-	if numpy.any(r <= 0):
-		bad = secondary_names[int(numpy.argmin(r))]
-		raise ValueError(f"Secondary motif '{bad}' does not fit within the "
-			f"flanking `margin` ({margin}) region around the primary motif "
-			f"'{primary_name}' (width {w_p}).")
+	quad_opt_counts = margin - secondary_widths + 1
+	if numpy.any(quad_opt_counts <= 0):
+		bad = secondary_names[int(numpy.argmin(quad_opt_counts))]
+		raise ValueError(f"Secondary motif '{bad}' (width "
+			f"{int(secondary_widths[int(numpy.argmin(quad_opt_counts))])}) "
+			f"does not fit within the flanking `margin` ({margin}) region.")
 
 	# Scan for the primary motif's best site per sequence.
 	primary_positions, primary_strands = _spamo_primary_sites(X, n_seqs,
@@ -502,69 +562,115 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)
 
-	# Compute the enrichment statistics for each secondary motif and strand
-	# category. This operates on the small position/strand arrays only, and
-	# so is not a throughput bottleneck.
-	num_bins_per_side = int(numpy.ceil(range_ / bin_size_bp))
-	n_bins_tested = 2 * num_bins_per_side
+	# Compute the enrichment statistics for each secondary motif. This
+	# operates on the small position/strand arrays only, and so is not a
+	# throughput bottleneck.
+	n_orients = len(_ORIENTATION_NAMES_RC) if reverse_complement else 2
+	orientation_names = (_ORIENTATION_NAMES_RC if reverse_complement
+		else _ORIENTATION_NAMES_NORC)
+	mult = numpy.array([1, 1, 1, 1, 2, 2, 2, 2, 4])[:n_orients]
+	test_max = int(numpy.ceil(range_ / bin_size_bp))
 
 	rows = []
 	for k in range(n_motifs):
 		w_s = int(secondary_widths[k])
-		r_k = (2 * margin - w_p - w_s) / 2.0
-		q = bin_size_bp / (2 * r_k + 1)
+
+		quad_opt_count = margin - w_s + 1
+		quad_bin_count = quad_opt_count // bin_size_bp
+		quad_leftover = quad_opt_count % bin_size_bp
+		n_bins = quad_bin_count + (1 if quad_leftover else 0)
 
 		valid = (primary_positions != -1) & (secondary_positions[k] != -1)
-		p_pos = primary_positions[valid]
-		s_pos = secondary_positions[k, valid]
-		same_strand = secondary_strands[k, valid] == primary_strands[valid]
+		n_total = int(valid.sum())
 
-		# Signed offset f: D = gap between closest edges; f = -(D+1) if the
-		# secondary is 5' of the primary, else f = D+1 (f is never 0).
+		if n_total == 0 or n_bins == 0:
+			continue
+
+		p_pos = primary_positions[valid]
+		p_strand = primary_strands[valid]
+		s_pos = secondary_positions[k, valid]
+		s_strand = secondary_strands[k, valid]
+
+		# Gap D (edge-to-edge, counting from 0) between the primary and
+		# secondary sites -- unaffected by strand, since it's a purely
+		# positional quantity.
 		secondary_first = (s_pos + w_s) <= p_pos
 		D = numpy.where(secondary_first, p_pos - (s_pos + w_s),
 			s_pos - (p_pos + w_p))
-		sign = numpy.where(secondary_first, -1, 1)
 
-		for category, mask in (('same', same_strand), ('opposite', ~same_strand)):
-			n = int(mask.sum())
+		# "Upstream"/"downstream" is relative to the *primary's own*
+		# matched strand, not literal sequence coordinates: rotate the
+		# side label when the primary matched on the reverse strand.
+		# Verified against `bin_matches` in the reference binary's C
+		# source (`src/spamo-matches.c`).
+		side = numpy.where(secondary_first ^ (p_strand == 1), 0, 1)
+		same_strand = s_strand == p_strand
+		opposite_bit = (~same_strand).astype(numpy.int64)
+		quad = 2 * side + opposite_bit
+		# quad 0 = upstream_same, 1 = upstream_opposite,
+		# 2 = downstream_same, 3 = downstream_opposite.
 
-			if n == 0:
-				rows.append((secondary_names[k], k, w_s, category, 0,
-					n_bins_tested, numpy.nan, numpy.nan, 0, 1.0, 1.0))
+		bin_idx = numpy.minimum(D // bin_size_bp, n_bins - 1)
+
+		quad_counts = numpy.zeros((4, n_bins), dtype=numpy.int64)
+		for q in range(4):
+			sel = quad == q
+			if sel.any():
+				quad_counts[q] = numpy.bincount(bin_idx[sel], minlength=n_bins)
+
+		# The 5 "palindrome-tolerant" combinations -- each pools a pair (or
+		# all 4) of the raw quadrant counts above.
+		counts = numpy.empty((9, n_bins), dtype=numpy.int64)
+		counts[0:4] = quad_counts
+		counts[4] = quad_counts[0] + quad_counts[1]  # upstream_secondary_pal
+		counts[5] = quad_counts[0] + quad_counts[3]  # upstream_primary_pal
+		counts[6] = quad_counts[1] + quad_counts[2]  # downstream_primary_pal
+		counts[7] = quad_counts[2] + quad_counts[3]  # downstream_secondary_pal
+		counts[8] = counts[4] + counts[7]            # both_pal
+		counts = counts[:n_orients]
+
+		# Null probability for a bin: its share of the total space spanned
+		# by all 4 quadrants (not just the quadrant(s) this orientation
+		# covers), scaled by how many quadrants this orientation pools.
+		denom = (4 if reverse_complement else 2) * quad_opt_count
+		base_probs = numpy.full(n_bins, bin_size_bp / denom)
+		if quad_leftover:
+			base_probs[-1] = quad_leftover / denom
+		probs = mult[:, None] * base_probs[None, :]
+
+		p_values = scipy.stats.binom.sf(counts - 1, n_total, probs)
+
+		n_bins_tested = min(quad_bin_count, test_max) + (1 if quad_leftover else 0)
+		tests = n_orients * n_bins_tested
+		adj_p_values = p_values * tests
+
+		testable = numpy.arange(n_bins) < test_max
+		if not testable.any():
+			continue
+
+		masked_adj = numpy.where(testable[None, :], adj_p_values, numpy.inf)
+		best_orient, best_bin = numpy.unravel_index(
+			numpy.argmin(masked_adj), masked_adj.shape)
+		e_value = float(masked_adj[best_orient, best_bin]) * n_motifs
+
+		sig_orients, sig_bins = numpy.where(
+			testable[None, :] & (adj_p_values <= cutoff))
+
+		if len(sig_orients) == 0:
+			if e_value > evalue_threshold:
 				continue
+			sig_orients = numpy.array([best_orient])
+			sig_bins = numpy.array([best_bin])
 
-			Dc, signc = D[mask], sign[mask]
-			in_range = Dc < range_
+		for o, b in zip(sig_orients, sig_bins):
+			gap_lo = int(b) * bin_size_bp
+			gap_hi = gap_lo + bin_size_bp - 1
+			if quad_leftover and b == quad_bin_count:
+				gap_hi = quad_opt_count - 1
 
-			pos_bins = (Dc[in_range & (signc > 0)] // bin_size_bp).astype(numpy.int64)
-			neg_bins = (Dc[in_range & (signc < 0)] // bin_size_bp).astype(numpy.int64)
-
-			pos_counts = numpy.bincount(pos_bins, minlength=num_bins_per_side)[:num_bins_per_side]
-			neg_counts = numpy.bincount(neg_bins, minlength=num_bins_per_side)[:num_bins_per_side]
-
-			# q is identical for every bin (fixed width, fixed N), so
-			# binom.sf is monotonic in the count -- the best bin is simply
-			# whichever has the most sequences, no per-bin test needed.
-			all_counts = numpy.concatenate([neg_counts, pos_counts])
-			best = int(numpy.argmax(all_counts))
-			best_count = int(all_counts[best])
-
-			p_value = float(scipy.stats.binom.sf(best_count - 1, n, q))
-			e_value = min(p_value * n_bins_tested * 2 * n_motifs, 1.0)
-
-			if best < num_bins_per_side:
-				b = best
-				lo_D, hi_D = b * bin_size_bp, (b + 1) * bin_size_bp - 1
-				best_offset_lo, best_offset_hi = -(hi_D + 1), -(lo_D + 1)
-			else:
-				b = best - num_bins_per_side
-				lo_D, hi_D = b * bin_size_bp, (b + 1) * bin_size_bp - 1
-				best_offset_lo, best_offset_hi = lo_D + 1, hi_D + 1
-
-			rows.append((secondary_names[k], k, w_s, category, n,
-				n_bins_tested, int(best_offset_lo), int(best_offset_hi),
-				best_count, p_value, float(e_value)))
+			rows.append((secondary_names[k], k, w_s, orientation_names[o],
+				n_total, n_bins_tested, gap_lo, gap_hi, int(counts[o, b]),
+				float(p_values[o, b]), float(adj_p_values[o, b]), e_value))
 
 	result = pandas.DataFrame(rows, columns=columns)
 
