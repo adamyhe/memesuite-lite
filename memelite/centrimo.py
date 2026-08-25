@@ -122,8 +122,7 @@ def _centrimo_best_sites(X, n_seqs, seq_len, pwm, pwm_lengths, score_thresholds,
 							continue
 						score_rc += pwm[idx, rc0 + j]
 
-					if score_rc > score:
-						score = score_rc
+					score = max(score, score_rc)
 
 				center = i + (w - 1) / 2.0
 				if score > best_score:
@@ -184,7 +183,7 @@ def _load_sequences(sequences, alphabet, seqlen):
 
 
 def centrimo(motifs, sequences, control_sequences=None,
-	alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
+	alphabet=('A', 'C', 'G', 'T'), bin_size=0.1,
 	eps=0.0001, threshold=0.001, min_width=1, max_width=None, width_step=2,
 	window_widths=None, reverse_complement=True, separate_strands=False,
 	flip=False, optimize_score=False, max_score_thresholds=50, seqlen=None,
@@ -288,9 +287,9 @@ def centrimo(motifs, sequences, control_sequences=None,
 		above. Its sequences must be equal-length among themselves, but need
 		not match the length or count of `sequences`. Default is None.
 
-	alphabet: list, optional
+	alphabet: list or tuple, optional
 		A list of characters to use for the alphabet, defining the order that
-		characters should appear. Default is ['A', 'C', 'G', 'T'].
+		characters should appear. Default is ('A', 'C', 'G', 'T').
 
 	bin_size: float, optional
 		The size of the bins discretizing the PWM scores when converting the

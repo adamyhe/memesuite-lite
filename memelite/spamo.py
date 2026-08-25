@@ -208,13 +208,8 @@ def _spamo_secondary_sites(X, n_seqs, seq_len, primary_positions,
 				continue
 
 			base = s * seq_len
-			lo = p - margin
-			if lo < 0:
-				lo = 0
-
-			hi = p + w_p + margin - w_s
-			if hi > seq_len - w_s:
-				hi = seq_len - w_s
+			lo = max(p - margin, 0)
+			hi = min(p + w_p + margin - w_s, seq_len - w_s)
 
 			best_score = -1e300
 			best_i = -1
@@ -257,7 +252,7 @@ def _spamo_secondary_sites(X, n_seqs, seq_len, primary_positions,
 
 
 def spamo(primary_motif, secondary_motifs, sequences,
-	alphabet=['A', 'C', 'G', 'T'], margin=150, range_=None, bin_size_bp=1,
+	alphabet=('A', 'C', 'G', 'T'), margin=150, range_=None, bin_size_bp=1,
 	bin_size=0.1, eps=0.0001, threshold=0.001, reverse_complement=True,
 	seqlen=None, return_site_positions=False, n_jobs=-1):
 	"""An implementation of the SpaMo algorithm from the MEME suite.
@@ -337,9 +332,9 @@ def spamo(primary_motif, secondary_motifs, sequences,
 		`sequences` (a FASTA filepath or a one-hot array of shape
 		(n_sequences, len(alphabet), sequence_length)).
 
-	alphabet: list, optional
+	alphabet: list or tuple, optional
 		A list of characters to use for the alphabet, defining the order that
-		characters should appear. Default is ['A', 'C', 'G', 'T'].
+		characters should appear. Default is ('A', 'C', 'G', 'T').
 
 	margin: int, optional
 		The number of bp to exclude from each edge of the sequence when

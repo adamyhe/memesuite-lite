@@ -5,15 +5,10 @@ import math
 import numba
 import numpy
 import pandas
-import time
 
 from .io import read_meme
 from .io import _fasta_to_flat_array
-from .utils import logaddexp2
-from .utils import _pwm_to_mapping
 from .utils import _all_pwm_to_mapping
-
-from tqdm import tqdm
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
