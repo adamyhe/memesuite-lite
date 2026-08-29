@@ -143,6 +143,56 @@ def test_spamo_same_vs_opposite_strand_discrimination():
 	assert not _has_row(result, 's1', 'downstream_same')
 
 
+def test_spamo_norc_recovers_downstream_signal():
+	# With reverse_complement=False, strand is moot (always "same", since
+	# only the forward strand is ever scanned) and signal only ever lands
+	# in the even-indexed raw quadrants (upstream=0, downstream=2 in the
+	# 4-quadrant numbering) -- a naive `[:2]` slice would keep the always-
+	# empty odd-indexed quadrant instead of the real downstream one.
+	#
+	# The full 9-category orientation model is still used (confirmed
+	# empirically against the real binary's own `-norc` mode, which does
+	# *not* collapse to a simpler category set): with the opposite-strand
+	# quadrants always empty, 'downstream_same' and every combined category
+	# that includes it ('downstream_primary_pal', 'downstream_secondary_pal',
+	# 'both_pal') are all equally significant here, while any category
+	# built only from empty quadrants ('upstream_same', 'upstream_opposite',
+	# 'downstream_opposite', 'upstream_secondary_pal', 'upstream_primary_pal')
+	# must be absent.
+	n_seqs, seq_len = 300, 500
+	primary = one_hot_encode("ACGTGCA")
+	secondary = one_hot_encode("TTGCCAA")
+	w_p = primary.shape[-1]
+
+	primary_pos = 246
+	gap = 20
+	secondary_pos = primary_pos + w_p + gap
+
+	X = _make_one_hot((n_seqs, 4, seq_len), random_state=43)
+	_plant(X, primary, [primary_pos] * n_seqs)
+	_plant(X, secondary, [secondary_pos] * 150)
+
+	result = spamo({'p1': primary.astype('float64')},
+		{'s1': secondary.astype('float64')}, X, threshold=0.001,
+		reverse_complement=False)
+
+	assert tuple(result.columns) == COLUMNS
+	row = _row(result, 's1', 'downstream_same')
+	assert row['n_matching_sequences'] >= 0.9 * 150
+	assert row['gap_lo'] <= gap <= row['gap_hi']
+	assert row['e_value'] < 1e-10
+
+	for orientation in ('downstream_primary_pal', 'downstream_secondary_pal',
+			'both_pal'):
+		assert _has_row(result, 's1', orientation)
+
+	for orientation in ('upstream_same', 'upstream_opposite',
+			'downstream_opposite', 'upstream_secondary_pal',
+			'upstream_primary_pal'):
+		assert not _has_row(result, 's1', orientation)
+	assert not _has_row(result, 's1', 'upstream')
+
+
 def test_spamo_side_rotates_with_primary_strand():
 	# The primary is planted on the reverse-complement strand. A secondary
 	# site placed literally *before* the primary in raw sequence

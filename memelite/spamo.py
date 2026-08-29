@@ -24,15 +24,15 @@ from .centrimo import _load_sequences
 # the opposite bit order, but doesn't reproduce the binary's actual reported
 # orientation for a given planted signal; a set of controlled probes (each
 # varying exactly one of side/strand/primary-strand) resolved the true
-# mapping unambiguously. Used only when `reverse_complement` is True;
-# `_ORIENTATION_NAMES_NORC` is used otherwise, since there is then no strand
-# distinction to make at all.
+# mapping unambiguously. All 9 names are used regardless of
+# `reverse_complement` -- confirmed empirically that the real binary's
+# `-norc` does *not* collapse to a simpler category set (see `spamo()`'s
+# docstring/implementation for why).
 _ORIENTATION_NAMES_RC = (
 	'upstream_same', 'upstream_opposite', 'downstream_same', 'downstream_opposite',
 	'upstream_secondary_pal', 'upstream_primary_pal', 'downstream_primary_pal',
 	'downstream_secondary_pal', 'both_pal',
 )
-_ORIENTATION_NAMES_NORC = ('upstream', 'downstream')
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
@@ -321,11 +321,16 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	proportional to how much of the total 4-quadrant space that bin/category
 	covers -- not two independent same-strand/opposite-strand tests with
 	separate `N`s, which is what this package's implementation did before
-	this was corrected against source. Every `(orientation, bin)` p-value is
-	Bonferroni-corrected (`adj_p_value`) by the number of orientation
-	categories (9, or 2 if `reverse_complement` is False) times the number
-	of bins tested (bounded by `range_`); a further, *separate* correction
-	by the number of secondary motifs gives the motif-level `e_value`.
+	this was corrected against source. All 9 categories, and the same
+	4-quadrant-space denominator, are used regardless of
+	`reverse_complement`: with it False, only the forward strand is ever
+	scanned, so the opposite-strand quadrants (and any combined category
+	built from one) are always empty -- confirmed empirically that the real
+	binary's `-norc` behaves the same way, rather than collapsing to a
+	simpler 2-category model. Every `(orientation, bin)` p-value is
+	Bonferroni-corrected (`adj_p_value`) by 9 times the number of bins
+	tested (bounded by `range_`); a further, *separate* correction by the
+	number of secondary motifs gives the motif-level `e_value`.
 
 	A secondary motif's rows are: every `(orientation, bin)` whose
 	`adj_p_value` is at or below `cutoff`; or, if none qualify but the
@@ -449,8 +454,9 @@ def spamo(primary_motif, secondary_motifs, sequences,
 		when a motif is omitted, and when it gets multiple rows), columns
 		`motif_name, motif_idx, width, orientation, n_sequences,
 		n_bins_tested, gap_lo, gap_hi, n_matching_sequences, p_value,
-		adj_p_value, e_value`. `orientation` is one of the 9 (or 2, if
-		`reverse_complement` is False) category names described above.
+		adj_p_value, e_value`. `orientation` is one of the 9 category names
+		described above (only the 4 `same`-strand-including ones can ever
+		appear when `reverse_complement` is False).
 		`gap_lo`/`gap_hi` are the inclusive bp range (edge-to-edge, always
 		non-negative) of the reported bin. `e_value` is a motif-level
 		quantity, identical across every row belonging to the same
@@ -565,10 +571,21 @@ def spamo(primary_motif, secondary_motifs, sequences,
 	# Compute the enrichment statistics for each secondary motif. This
 	# operates on the small position/strand arrays only, and so is not a
 	# throughput bottleneck.
-	n_orients = len(_ORIENTATION_NAMES_RC) if reverse_complement else 2
-	orientation_names = (_ORIENTATION_NAMES_RC if reverse_complement
-		else _ORIENTATION_NAMES_NORC)
-	mult = numpy.array([1, 1, 1, 1, 2, 2, 2, 2, 4])[:n_orients]
+	#
+	# The full 9-orientation model (and its 4x-quad_opt_count null-
+	# probability denominator) is used regardless of `reverse_complement`
+	# -- confirmed empirically against the real binary's `-norc` mode
+	# (which does *not* collapse to a simpler 2-orientation/2x-denominator
+	# model, despite the source's own `revcomp ? 4 : 2`-style branches
+	# reading as if it should; those apparently key off whether the
+	# alphabet itself is complementable, e.g. DNA, not the `-norc` flag).
+	# `same_strand` is trivially always True when `reverse_complement` is
+	# False (both strand values are always 0), so signal only ever lands in
+	# the even-indexed raw quadrants (0=upstream, 2=downstream) and the
+	# categories built from odd-indexed ones are always empty -- exactly
+	# matching what the real binary's own `-norc` output looks like.
+	orientation_names = _ORIENTATION_NAMES_RC
+	mult = numpy.array([1, 1, 1, 1, 2, 2, 2, 2, 4])
 	test_max = int(numpy.ceil(range_ / bin_size_bp))
 
 	rows = []
@@ -627,12 +644,11 @@ def spamo(primary_motif, secondary_motifs, sequences,
 		counts[6] = quad_counts[1] + quad_counts[2]  # downstream_primary_pal
 		counts[7] = quad_counts[2] + quad_counts[3]  # downstream_secondary_pal
 		counts[8] = counts[4] + counts[7]            # both_pal
-		counts = counts[:n_orients]
 
 		# Null probability for a bin: its share of the total space spanned
 		# by all 4 quadrants (not just the quadrant(s) this orientation
 		# covers), scaled by how many quadrants this orientation pools.
-		denom = (4 if reverse_complement else 2) * quad_opt_count
+		denom = 4 * quad_opt_count
 		base_probs = numpy.full(n_bins, bin_size_bp / denom)
 		if quad_leftover:
 			base_probs[-1] = quad_leftover / denom
@@ -641,7 +657,7 @@ def spamo(primary_motif, secondary_motifs, sequences,
 		p_values = scipy.stats.binom.sf(counts - 1, n_total, probs)
 
 		n_bins_tested = min(quad_bin_count, test_max) + (1 if quad_leftover else 0)
-		tests = n_orients * n_bins_tested
+		tests = 9 * n_bins_tested
 		adj_p_values = p_values * tests
 
 		testable = numpy.arange(n_bins) < test_max
