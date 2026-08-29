@@ -23,6 +23,7 @@ import shutil
 import subprocess
 
 import numpy
+import pandas
 import pytest
 
 from memelite.centrimo import centrimo
@@ -240,3 +241,97 @@ def test_centrimo_matches_reference_optimize_score(tmp_path):
 	assert abs(row["n_sequences"] - int(real["total_sites"])) <= 1
 	assert numpy.log10(row["e_value"]) == pytest.approx(
 		numpy.log10(float(real["E-value"])), abs=1.5)
+
+
+def test_centrimo_matches_reference_separate_strands(tmp_path):
+	# A non-palindromic motif, planted only as its reverse complement, so
+	# the real binary's `-m1` (reverse-complement) row is the significant
+	# one and `+m1` isn't reported at all (falls below the E-value cutoff).
+	seq_len = 41
+	motif_str = "ACGTGCA"
+	rc_str = "TGCACGT"
+	w = len(motif_str)
+	center = (seq_len - w) // 2
+
+	seqs = _random_sequences(40, seq_len, random_state=20)
+	n_planted = 20
+	offsets = [center] * n_planted + [None] * (len(seqs) - n_planted)
+	seqs = _plant(seqs, rc_str, offsets)
+
+	fasta_path = tmp_path / "seqs.fasta"
+	_write_fasta(fasta_path, seqs)
+
+	pwm = _motif_from_str(motif_str)
+	meme_path = tmp_path / "motif.meme"
+	write_meme(str(meme_path), {"m1": pwm})
+
+	threshold = 0.01
+	real = _run_real_centrimo(tmp_path, fasta_path, meme_path, threshold,
+		extra_args=["--sep"])
+	real_by_id = {row["motif_id"].strip("'"): row for row in real}
+	assert "-m1" in real_by_id
+
+	result = centrimo({"m1": pwm}, _seqs_to_onehot(seqs), threshold=threshold,
+		eps=EPS, separate_strands=True)
+	assert list(result["motif_name"]) == ["m1", "m1-rc"]
+
+	fwd_row = result[result["motif_name"] == "m1"].iloc[0]
+	rc_row = result[result["motif_name"] == "m1-rc"].iloc[0]
+	real_row = real_by_id["-m1"]
+
+	# The forward row is just background noise -- confirm ours agrees it's
+	# nowhere near as significant as the real reverse-complement row, even
+	# though we always report both rows regardless of significance (ours
+	# also caps e_value at 1.0, unlike the reference binary's E-value,
+	# which can exceed 1 -- so compare orders of magnitude, not a raw >).
+	assert fwd_row["e_value"] > 100 * rc_row["e_value"]
+
+	assert rc_row["n_sequences"] == int(real_row["total_sites"])
+	assert abs(rc_row["n_matching_sequences"] - int(real_row["sites_in_bin"])) <= 1
+	assert rc_row["best_window_width"] == float(real_row["bin_width"])
+	assert numpy.log10(rc_row["p_value"]) == pytest.approx(
+		numpy.log10(float(real_row["p-value"])), abs=1.5)
+	assert numpy.log10(rc_row["e_value"]) == pytest.approx(
+		numpy.log10(float(real_row["E-value"])), abs=1.5)
+
+
+def test_centrimo_matches_reference_flip_is_noop(tmp_path):
+	# `--flip` is purely presentational in the reference binary too: confirm
+	# its TSV output is byte-for-byte identical with and without the flag
+	# (matching this package's own documented flip=True/False equivalence
+	# on every reported statistic).
+	seq_len = 41
+	motif_str = "ACGTGCA"
+	rc_str = "TGCACGT"
+	w = len(motif_str)
+	center = (seq_len - w) // 2
+
+	seqs = _random_sequences(40, seq_len, random_state=21)
+	n_planted = 20
+	offsets = [center] * n_planted + [None] * (len(seqs) - n_planted)
+	seqs = _plant(seqs, rc_str, offsets)
+
+	fasta_path = tmp_path / "seqs.fasta"
+	_write_fasta(fasta_path, seqs)
+
+	pwm = _motif_from_str(motif_str)
+	meme_path = tmp_path / "motif.meme"
+	write_meme(str(meme_path), {"m1": pwm})
+
+	threshold = 0.01
+	real_noflip = _run_real_centrimo(tmp_path, fasta_path, meme_path,
+		threshold, extra_args=["--sep"], tag="out_noflip")
+	real_flip = _run_real_centrimo(tmp_path, fasta_path, meme_path,
+		threshold, extra_args=["--sep", "--flip"], tag="out_flip")
+	assert real_noflip == real_flip
+
+	no_flip = centrimo({"m1": pwm}, _seqs_to_onehot(seqs), threshold=threshold,
+		eps=EPS, separate_strands=True)
+	flipped = centrimo({"m1": pwm}, _seqs_to_onehot(seqs), threshold=threshold,
+		eps=EPS, separate_strands=True, flip=True)
+	pandas.testing.assert_frame_equal(no_flip, flipped)
+
+	rc_row = no_flip[no_flip["motif_name"] == "m1-rc"].iloc[0]
+	real_row = real_noflip[0]
+	assert numpy.log10(rc_row["e_value"]) == pytest.approx(
+		numpy.log10(float(real_row["E-value"])), abs=1.5)
